@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Telegram → Facebook 群消息转发",
-  "version": "1.9.13",
+  "version": "1.9.14",
   "description": "在 Telegram 标签页配置 FB 群，手动打开群聊页后转发消息",
   "permissions": ["storage", "tabs", "alarms", "notifications", "scripting", "cookies"],
   "host_permissions": [

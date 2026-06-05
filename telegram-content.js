@@ -119,7 +119,7 @@
     const out = [];
     for (const n of raw) {
       const s = normalizeSenderName(n);
-      if (!s || s === "未知" || seen.has(s)) continue;
+      if (!s || s === "未知" || !isLikelySenderName(s) || seen.has(s)) continue;
       seen.add(s);
       out.push(s);
     }
@@ -139,7 +139,7 @@
 
   function collectPeerKeysForSender(targetName) {
     const keys = new Set();
-    const ctx = { lastSender: "", lastPeerKey: "" };
+    const ctx = { lastSender: "", lastPeerKey: "", peerNames: new Map() };
     const target = normalizeSenderName(targetName);
     if (!target) return [];
 
@@ -180,7 +180,7 @@
 
   function syncMessageCheckboxesFromWalk(watchList, watchPeers) {
     const peerSet = new Set(watchPeers || []);
-    const ctx = { lastSender: "", lastPeerKey: "" };
+    const ctx = { lastSender: "", lastPeerKey: "", peerNames: new Map() };
 
     for (const raw of findMessageNodes()) {
       const msg = normalizeMessageEl(raw);
@@ -265,11 +265,14 @@
   }
 
   function isFirstInGroup(msg) {
-    return (
-      msg.classList.contains("first-in-group") ||
-      msg.classList.contains("first-in-document") ||
-      !!msg.querySelector(".message-subheader .sender-title, .message-subheader .message-title")
-    );
+    const sub = msg.querySelector(".message-subheader");
+    if (sub) {
+      for (const sel of [".sender-title", ".message-title", ".peer-title"]) {
+        const t = sub.querySelector(sel)?.textContent?.trim();
+        if (isLikelySenderName(t)) return true;
+      }
+    }
+    return msg.classList.contains("first-in-group") || msg.classList.contains("first-in-document");
   }
 
   function isGroupedContinuation(msg) {
@@ -346,6 +349,18 @@
     return "";
   }
 
+  function rememberPeerName(ctx, peerKey, name) {
+    if (!peerKey || !name || name === "未知") return;
+    if (!ctx.peerNames) ctx.peerNames = new Map();
+    const prev = ctx.peerNames.get(peerKey);
+    if (!prev || name.length < prev.length) ctx.peerNames.set(peerKey, name);
+  }
+
+  function nameFromPeer(ctx, peerKey) {
+    if (!peerKey || !ctx.peerNames) return "";
+    return ctx.peerNames.get(peerKey) || "";
+  }
+
   function resolveMessageSender(el, ctx) {
     const msg = normalizeMessageEl(el);
     const listItem = getMessageListItem(msg);
@@ -353,9 +368,9 @@
     const direct = extractSender(msg, listItem);
 
     if (direct) {
-      if (peerKey && peerKey !== ctx.lastPeerKey) {
-        ctx.lastPeerKey = peerKey;
-      }
+      rememberPeerName(ctx, peerKey, direct);
+      if (peerKey) ctx.lastPeerKey = peerKey;
+      ctx.lastSender = direct;
       return direct;
     }
 
@@ -364,29 +379,47 @@
       ctx.lastSender = "";
     }
 
+    const peerName = nameFromPeer(ctx, peerKey);
+    if (peerName) {
+      ctx.lastSender = peerName;
+      if (peerKey) ctx.lastPeerKey = peerKey;
+      return peerName;
+    }
+
     if (isFirstInGroup(msg)) {
       const fromPrev = findSenderFromPreviousMessages(msg);
-      if (fromPrev) return fromPrev;
+      if (fromPrev) {
+        rememberPeerName(ctx, peerKey, fromPrev);
+        ctx.lastSender = fromPrev;
+        return fromPrev;
+      }
       return "";
     }
 
     if (isGroupedContinuation(msg) && ctx.lastSender) {
       if (!peerKey || !ctx.lastPeerKey || peerKey === ctx.lastPeerKey) {
+        rememberPeerName(ctx, peerKey, ctx.lastSender);
         return ctx.lastSender;
       }
     }
 
     if (ctx.lastSender && (!peerKey || peerKey === ctx.lastPeerKey)) {
+      rememberPeerName(ctx, peerKey, ctx.lastSender);
       return ctx.lastSender;
     }
 
-    return findSenderFromPreviousMessages(msg);
+    const fromPrev = findSenderFromPreviousMessages(msg);
+    if (fromPrev) {
+      rememberPeerName(ctx, peerKey, fromPrev);
+      ctx.lastSender = fromPrev;
+    }
+    return fromPrev;
   }
 
   /** 按 DOM 顺序遍历，补全群聊里“不重复显示昵称”的发送者 */
   function walkMessagesWithSender() {
     const nodes = findMessageNodes();
-    const ctx = { lastSender: "", lastPeerKey: "" };
+    const ctx = { lastSender: "", lastPeerKey: "", peerNames: new Map() };
     const result = [];
 
     for (const raw of nodes) {
@@ -398,7 +431,7 @@
       }
       const sender = resolveMessageSender(el, ctx);
       if (sender) ctx.lastSender = sender;
-      if (!sender) continue;
+      if (!sender || sender === "未知") continue;
       result.push({ el, sender });
     }
     return result;
@@ -406,11 +439,42 @@
 
   function collectSenders() {
     try {
-      const names = new Set();
-      for (const { sender } of walkMessagesWithSender()) {
-        if (sender && sender !== "未知") names.add(sender);
+      const byPeer = new Map();
+      const orphan = new Set();
+      const ctx = { lastSender: "", lastPeerKey: "", peerNames: new Map() };
+
+      for (const raw of findMessageNodes()) {
+        const msg = normalizeMessageEl(raw);
+        if (isOwnMessage(msg)) {
+          ctx.lastSender = "";
+          ctx.lastPeerKey = "";
+          continue;
+        }
+        const listItem = getMessageListItem(msg);
+        const peerKey = extractSenderPeerKey(listItem);
+        const sender = resolveMessageSender(msg, ctx);
+        if (!sender || sender === "未知" || !isLikelySenderName(sender)) continue;
+
+        if (peerKey && !peerKey.startsWith("name:")) {
+          const prev = byPeer.get(peerKey);
+          if (!prev || sender.length < prev.length) byPeer.set(peerKey, sender);
+        } else {
+          orphan.add(sender);
+        }
       }
-      return [...names].sort((a, b) => a.localeCompare(b, "zh"));
+
+      const out = new Set(byPeer.values());
+      for (const name of orphan) {
+        let merged = false;
+        for (const [, peerName] of byPeer) {
+          if (senderMatches(name, [peerName])) {
+            merged = true;
+            break;
+          }
+        }
+        if (!merged) out.add(name);
+      }
+      return [...out].sort((a, b) => a.localeCompare(b, "zh"));
     } catch (err) {
       console.error("[tg-to-fb] collectSenders failed", err);
       return [];
@@ -557,10 +621,33 @@
 
   function isLikelySenderName(text) {
     const t = (text || "").trim();
-    if (!t || t.length >= 80) return false;
+    if (!t || t.length > 40) return false;
+    if (t.length < 2) return false;
     if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(t)) return false;
-    if (/^(已发送|已送达|已读|发送中|edited|已编辑)$/i.test(t)) return false;
+    if (/^(已发送|已送达|已读|发送中|edited|已编辑|admin|channel)$/i.test(t)) return false;
     if (/^via @/i.test(t)) return false;
+    if (/https?:\/\//i.test(t) || /^www\./i.test(t)) return false;
+    if (/^[\d\s\W_]+$/.test(t)) return false;
+    if ((t.match(/\s+/g) || []).length >= 3) return false;
+    if (/(.)\1{2,}/u.test(t)) return false;
+
+    const compact = t.replace(/\s+/g, "");
+    if (compact.length >= 10) {
+      const vowels = (compact.match(/[aeiouAEIOUäöüÄÖÜáéíóúàèìòù]/g) || []).length;
+      if (vowels / compact.length < 0.12) return false;
+    }
+
+    if (/^[\x00-\x7F]+$/.test(t) && t.length > 14 && !/\s/.test(t)) return false;
+
+    const words = t.split(/\s+/).filter(Boolean);
+    if (words.length >= 2 && t.length > 10) {
+      const allLatin = words.every((w) => /^[A-Za-zßäöüÄÖÜ]+$/.test(w) && w.length >= 4);
+      if (allLatin) {
+        const vowels = (t.match(/[aeiouAEIOUäöüÄÖÜ]/gi) || []).length;
+        if (vowels < 2) return false;
+      }
+    }
+
     return true;
   }
 
@@ -568,20 +655,17 @@
     const msg = normalizeMessageEl(el);
     const scope = listItem || getMessageListItem(msg);
 
-    const selectors = [
-      ".message-subheader .sender-title",
-      ".message-subheader .message-title",
-      ".message-subheader .peer-title",
-      ".sender-title",
-      ".message-title",
-      ".peer-title",
-      ".message-author",
-      ".user-title",
-    ];
-    for (const sel of selectors) {
-      const node = msg.querySelector(sel) || scope.querySelector(sel);
-      const t = node?.textContent?.trim();
-      if (isLikelySenderName(t)) return normalizeSenderName(t);
+    const sub = msg.querySelector(".message-subheader");
+    if (sub) {
+      for (const sel of [".sender-title", ".message-title", ".peer-title", ".message-author"]) {
+        const node = sub.querySelector(sel);
+        const t = node?.textContent?.trim();
+        if (isLikelySenderName(t)) return normalizeSenderName(t);
+      }
+      for (const node of sub.querySelectorAll(":scope > a, :scope > span")) {
+        const t = node.textContent?.trim();
+        if (isLikelySenderName(t)) return normalizeSenderName(t);
+      }
     }
 
     const avatar = findAvatarInListItem(scope);
@@ -590,14 +674,6 @@
       if (isLikelySenderName(img?.alt)) return normalizeSenderName(img.alt);
       const aria = avatar.getAttribute("aria-label") || avatar.title;
       if (isLikelySenderName(aria)) return normalizeSenderName(aria);
-    }
-
-    const sub = msg.querySelector(".message-subheader");
-    if (sub) {
-      for (const node of sub.querySelectorAll("span, a, div")) {
-        const t = node.textContent?.trim();
-        if (isLikelySenderName(t)) return normalizeSenderName(t);
-      }
     }
 
     return "";
@@ -772,7 +848,7 @@
   function injectMessageCheckboxes(opts = {}) {
     let injected = 0;
     const nodes = findMessageNodes();
-    const ctx = { lastSender: "", lastPeerKey: "" };
+    const ctx = { lastSender: "", lastPeerKey: "", peerNames: new Map() };
 
     for (const raw of nodes) {
       const msg = normalizeMessageEl(raw);
