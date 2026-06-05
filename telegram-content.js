@@ -17,6 +17,8 @@
   let lastSummaryText = "";
   let lastForwardUiText = "";
   let chatReadyForForward = false;
+  let senderSyncPausedUntil = 0;
+  let checkboxDelegationBound = false;
 
   scheduleBarInjection();
 
@@ -31,6 +33,7 @@
       return;
     }
     await loadConfig();
+    bindCheckboxDelegation();
     bindChatNavigation();
     await waitForTelegramShell(20000);
     scheduleBarInjection();
@@ -99,12 +102,147 @@
     });
   }
 
+  function normalizeSenderName(name) {
+    return String(name || "")
+      .replace(/\u200b/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function getWatchList() {
-    if (Array.isArray(config?.watchUserNames) && config.watchUserNames.length) {
-      return config.watchUserNames;
+    const raw = Array.isArray(config?.watchUserNames) && config.watchUserNames.length
+      ? config.watchUserNames
+      : config?.watchUserName
+        ? [config.watchUserName]
+        : [];
+    const seen = new Set();
+    const out = [];
+    for (const n of raw) {
+      const s = normalizeSenderName(n);
+      if (!s || s === "未知" || seen.has(s)) continue;
+      seen.add(s);
+      out.push(s);
     }
-    if (config?.watchUserName) return [config.watchUserName];
-    return [];
+    return out;
+  }
+
+  function getSenderFromControl(cb) {
+    if (!(cb instanceof HTMLInputElement)) return "";
+    const wrap = cb.closest(`.${CHECK_CLASS}`);
+    return normalizeSenderName(cb.dataset.sender || wrap?.dataset?.sender || "");
+  }
+
+  function getWatchPeerKeys() {
+    const raw = config?.watchSenderPeerKeys || [];
+    return [...new Set(raw.map((s) => String(s).trim()).filter(Boolean))];
+  }
+
+  function collectPeerKeysForSender(targetName) {
+    const keys = new Set();
+    const ctx = { lastSender: "", lastPeerKey: "" };
+    const target = normalizeSenderName(targetName);
+    if (!target) return [];
+
+    for (const raw of findMessageNodes()) {
+      const msg = normalizeMessageEl(raw);
+      if (isOwnMessage(msg)) {
+        ctx.lastSender = "";
+        ctx.lastPeerKey = "";
+        continue;
+      }
+      const sender = normalizeSenderName(resolveMessageSender(msg, ctx) || "");
+      if (sender) ctx.lastSender = sender;
+      const peerKey = extractSenderPeerKey(getMessageListItem(msg));
+      if (peerKey) ctx.lastPeerKey = peerKey;
+
+      if (senderMatches(sender, [target])) {
+        if (peerKey) keys.add(peerKey);
+        if (ctx.lastPeerKey) keys.add(ctx.lastPeerKey);
+      }
+    }
+    return [...keys];
+  }
+
+  function rebuildWatchPeerKeysForList(watchList) {
+    const keys = new Set();
+    for (const name of watchList || []) {
+      for (const pk of collectPeerKeysForSender(name)) keys.add(pk);
+    }
+    return [...keys];
+  }
+
+  function isMessageWatched(sender, peerKey, watchList, watchPeers) {
+    const peerSet = watchPeers instanceof Set ? watchPeers : new Set(watchPeers || []);
+    if (sender && senderMatches(sender, watchList)) return true;
+    if (peerKey && peerSet.has(peerKey)) return true;
+    return false;
+  }
+
+  function syncMessageCheckboxesFromWalk(watchList, watchPeers) {
+    const peerSet = new Set(watchPeers || []);
+    const ctx = { lastSender: "", lastPeerKey: "" };
+
+    for (const raw of findMessageNodes()) {
+      const msg = normalizeMessageEl(raw);
+      if (isOwnMessage(msg)) {
+        ctx.lastSender = "";
+        ctx.lastPeerKey = "";
+        continue;
+      }
+
+      const sender = normalizeSenderName(resolveMessageSender(msg, ctx) || "");
+      if (sender) ctx.lastSender = sender;
+      const peerKey = extractSenderPeerKey(getMessageListItem(msg));
+      if (peerKey) ctx.lastPeerKey = peerKey;
+
+      const byName = sender && senderMatches(sender, watchList);
+      const byPeer = peerKey && peerSet.has(peerKey);
+      const byGroupPeer =
+        !byName &&
+        !byPeer &&
+        isGroupedContinuation(msg) &&
+        ctx.lastPeerKey &&
+        peerSet.has(ctx.lastPeerKey) &&
+        ctx.lastSender &&
+        senderMatches(ctx.lastSender, watchList);
+      const checked = byName || byPeer || byGroupPeer;
+
+      const wrap = msg.querySelector(`.${CHECK_CLASS}`);
+      if (!wrap) continue;
+
+      const labelName = sender || ctx.lastSender || wrap.dataset.sender || "未知";
+      if (labelName !== "未知") {
+        wrap.dataset.sender = labelName;
+        const cb = wrap.querySelector(".tgfb-cb");
+        if (cb) {
+          cb.dataset.sender = labelName;
+          cb.checked = checked;
+          wrap.querySelector("label")?.setAttribute("title", `勾选后自动转发「${labelName}」`);
+        }
+      }
+    }
+  }
+
+  function bindCheckboxDelegation() {
+    if (checkboxDelegationBound) return;
+    checkboxDelegationBound = true;
+    document.addEventListener(
+      "change",
+      (e) => {
+        const cb = e.target;
+        if (!(cb instanceof HTMLInputElement)) return;
+        if (!cb.matches(".tgfb-cb, .tgfb-picker-cb")) return;
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        const sender = getSenderFromControl(cb);
+        if (!sender || sender === "未知") {
+          cb.checked = false;
+          return;
+        }
+        void toggleSender(sender, cb.checked);
+      },
+      true
+    );
   }
 
   function getFbUrlsText() {
@@ -391,8 +529,11 @@
   }
 
   function markSenderMessagesSeen(senderName) {
+    const watchPeers = new Set(collectPeerKeysForSender(senderName));
     for (const { el, sender } of walkMessagesWithSender()) {
-      if (!senderMatches(sender, [senderName])) continue;
+      const msg = normalizeMessageEl(el);
+      const peerKey = extractSenderPeerKey(getMessageListItem(msg));
+      if (!isMessageWatched(sender, peerKey, [senderName], watchPeers)) continue;
       const id = getMessageId(el);
       if (id) seenIds.add(id);
     }
@@ -440,22 +581,22 @@
     for (const sel of selectors) {
       const node = msg.querySelector(sel) || scope.querySelector(sel);
       const t = node?.textContent?.trim();
-      if (isLikelySenderName(t)) return t;
+      if (isLikelySenderName(t)) return normalizeSenderName(t);
     }
 
     const avatar = findAvatarInListItem(scope);
     if (avatar) {
       const img = avatar.querySelector("img");
-      if (isLikelySenderName(img?.alt)) return img.alt.trim();
+      if (isLikelySenderName(img?.alt)) return normalizeSenderName(img.alt);
       const aria = avatar.getAttribute("aria-label") || avatar.title;
-      if (isLikelySenderName(aria)) return aria.trim();
+      if (isLikelySenderName(aria)) return normalizeSenderName(aria);
     }
 
     const sub = msg.querySelector(".message-subheader");
     if (sub) {
       for (const node of sub.querySelectorAll("span, a, div")) {
         const t = node.textContent?.trim();
-        if (isLikelySenderName(t)) return t;
+        if (isLikelySenderName(t)) return normalizeSenderName(t);
       }
     }
 
@@ -463,23 +604,20 @@
   }
 
   function buildMessageActionsWrap(sender) {
+    const name = normalizeSenderName(sender) || "未知";
     const wrap = document.createElement("div");
     wrap.className = CHECK_CLASS;
-    wrap.dataset.sender = sender;
+    wrap.dataset.sender = name;
 
     const cb = document.createElement("input");
     cb.type = "checkbox";
     cb.className = "tgfb-cb";
-    cb.checked = senderMatches(sender, getWatchList());
+    cb.dataset.sender = name;
+    cb.checked = senderMatches(name, getWatchList());
 
     const label = document.createElement("label");
-    label.title = `勾选后自动转发「${sender}」`;
+    label.title = `勾选后自动转发「${name}」`;
     label.append(cb, document.createTextNode(" 自动"));
-
-    cb.addEventListener("change", (e) => {
-      e.stopPropagation();
-      toggleSender(sender, cb.checked);
-    });
 
     const btn = document.createElement("button");
     btn.type = "button";
@@ -539,28 +677,26 @@
 
   function messageNeedsCheckbox(msg) {
     if (msg.querySelector(`.${CHECK_CLASS}`)) return false;
-    const listItem = getMessageListItem(msg);
-    if (findAvatarInListItem(listItem)) return true;
-    return (
-      msg.classList.contains("has-guest-avatar") ||
-      msg.classList.contains("first-in-group") ||
-      msg.classList.contains("last-in-group") ||
-      msg.classList.contains("has-avatar") ||
-      isFirstInGroup(msg) ||
+    if (isOwnMessage(msg) || isServiceMessage(msg)) return false;
+    return !!(
+      getMessageContentAnchor(msg) ||
       msg.querySelector(".message-content-wrapper, .message-content")
     );
   }
 
   function syncExistingCheckboxSender(msg, sender) {
     const wrap = msg.querySelector(`.${CHECK_CLASS}`);
-    if (!wrap || !sender || sender === "未知") return;
-    if (wrap.dataset.sender === sender) return;
-    wrap.dataset.sender = sender;
+    const name = normalizeSenderName(sender);
+    if (!wrap || !name || name === "未知") return;
+    if (wrap.dataset.sender === name) return;
+    wrap.dataset.sender = name;
     const cb = wrap.querySelector(".tgfb-cb");
     if (cb) {
-      cb.dataset.sender = sender;
-      cb.checked = senderMatches(sender, getWatchList());
-      wrap.querySelector("label")?.setAttribute("title", `勾选后自动转发「${sender}」`);
+      cb.dataset.sender = name;
+      if (Date.now() >= senderSyncPausedUntil) {
+        cb.checked = senderMatches(name, getWatchList());
+      }
+      wrap.querySelector("label")?.setAttribute("title", `勾选后自动转发「${name}」`);
     }
   }
 
@@ -633,7 +769,7 @@
   }
 
   /** 自动勾选 + 立即转发按钮，放在头像下方 */
-  function injectMessageCheckboxes() {
+  function injectMessageCheckboxes(opts = {}) {
     let injected = 0;
     const nodes = findMessageNodes();
     const ctx = { lastSender: "", lastPeerKey: "" };
@@ -655,17 +791,17 @@
       }
       if (!messageNeedsCheckbox(msg)) continue;
 
-      const label = sender || "未知";
-      const wrap = buildMessageActionsWrap(label);
+      const wrap = buildMessageActionsWrap(sender || "未知");
       const btn = wrap.querySelector(".tgfb-forward-now");
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         e.preventDefault();
-        forwardMessageNow(msg, label, btn);
+        const liveSender = wrap.dataset.sender || normalizeSenderName(sender) || "未知";
+        forwardMessageNow(msg, liveSender, btn);
       });
       if (placeCheckboxOnMessage(msg, wrap)) injected++;
     }
-    syncAllCheckboxes();
+    if (!opts.skipSync) syncAllCheckboxes();
 
     if (countMessagesMissingCheckbox() > 0) scheduleInjectRetries();
 
@@ -698,42 +834,50 @@
     host.appendChild(hint);
 
     for (const name of senders) {
+      const norm = normalizeSenderName(name);
       const label = document.createElement("label");
       label.className = "tgfb-sender-item";
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.className = "tgfb-picker-cb";
-      cb.dataset.sender = name;
-      cb.checked = senderMatches(name, list);
-      cb.addEventListener("change", (e) => {
-        e.stopPropagation();
-        toggleSender(name, cb.checked);
-      });
-      label.append(cb, document.createTextNode(` ${name}`));
+      cb.dataset.sender = norm;
+      cb.checked = senderMatches(norm, list);
+      label.append(cb, document.createTextNode(` ${norm}`));
       host.appendChild(label);
     }
   }
 
-  function syncAllCheckboxes() {
+  function syncAllCheckboxes(force = false) {
+    if (!force && Date.now() < senderSyncPausedUntil) return;
     const list = getWatchList();
-    document.querySelectorAll(".tgfb-cb, .tgfb-picker-cb").forEach((cb) => {
-      const sender = cb.dataset.sender || cb.closest(`.${CHECK_CLASS}`)?.dataset?.sender;
+    const peers = getWatchPeerKeys();
+    syncMessageCheckboxesFromWalk(list, peers);
+    document.querySelectorAll(".tgfb-picker-cb").forEach((cb) => {
+      const sender = getSenderFromControl(cb);
       if (sender) cb.checked = senderMatches(sender, list);
     });
   }
 
   async function toggleSender(sender, enabled) {
-    const name = (sender || "").trim();
+    const name = normalizeSenderName(sender);
     if (!name || name === "未知") return;
+    senderSyncPausedUntil = Date.now() + 1200;
     const list = new Set(getWatchList());
     if (enabled) list.add(name);
-    else list.delete(name);
+    else {
+      list.delete(name);
+      for (const n of [...list]) {
+        if (senderMatches(n, [name])) list.delete(n);
+      }
+    }
     const watchUserNames = [...list];
-    config = { ...config, watchUserNames };
-    syncAllCheckboxes();
+    const watchSenderPeerKeys = rebuildWatchPeerKeysForList(watchUserNames);
+    config = { ...config, watchUserNames, watchSenderPeerKeys };
+    injectMessageCheckboxes({ skipSync: true });
+    syncAllCheckboxes(true);
     if (enabled) markSenderMessagesSeen(name);
     updateBarStatus(enabled ? `已监听：${name}` : `已取消：${name}`);
-    await saveConfig({ watchUserNames });
+    await saveConfig({ watchUserNames, watchSenderPeerKeys });
   }
 
   function messageHasMediaShell(msg) {
@@ -758,8 +902,10 @@
     forwardingIds.add(messageId);
 
     if (manual) {
-      updateBarStatus("手动转发中…");
-      showForwardStatus({ text: "手动转发中…", level: "info" });
+      const pending = forwardingIds.size;
+      const hint = pending > 1 ? `手动转发中（${pending} 条排队）…` : "手动转发中…";
+      updateBarStatus(hint);
+      showForwardStatus({ text: hint, level: "info" });
     } else if (messageHasMediaShell(msg)) {
       const hint = isRetry ? "图片重试中…" : "检测到图片，处理中…";
       updateBarStatus(hint);
@@ -850,15 +996,17 @@
 
   function scanNewMessages() {
     const watchList = getWatchList();
-    if (!config?.enabled || !watchList.length) return;
+    const watchPeers = getWatchPeerKeys();
+    if (!config?.enabled || (!watchList.length && !watchPeers.length)) return;
     if (!getFbUrlsText().trim()) return;
 
     for (const { el, sender } of walkMessagesWithSender()) {
       const messageId = getMessageId(el);
       if (!messageId || seenIds.has(messageId) || forwardingIds.has(messageId)) continue;
-      if (!senderMatches(sender, watchList)) continue;
 
       const msg = normalizeMessageEl(el);
+      const peerKey = extractSenderPeerKey(getMessageListItem(msg));
+      if (!isMessageWatched(sender, peerKey, watchList, watchPeers)) continue;
       if (isServiceMessage(msg)) {
         seenIds.add(messageId);
         continue;
@@ -869,12 +1017,10 @@
   }
 
   function senderMatches(sender, watchList) {
-    const a = (sender || "").trim().toLowerCase();
+    const a = normalizeSenderName(sender).toLowerCase();
     if (!a || a === "未知" || !watchList?.length) return false;
     return watchList.some((name) => {
-      const b = String(name || "")
-        .trim()
-        .toLowerCase();
+      const b = normalizeSenderName(name).toLowerCase();
       return b && a === b;
     });
   }
@@ -1698,6 +1844,7 @@
 
   function scheduleBarInjection() {
     const tryInject = () => {
+      bindCheckboxDelegation();
       if (!document.body && !document.documentElement) return;
       if (document.getElementById(BAR_ID)) return;
       try {

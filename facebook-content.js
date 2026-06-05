@@ -9,11 +9,19 @@
   const IMAGE_SEND_WAIT_FAST_MS = 380;
 
   let lastSentKey = "";
-  let sendInFlight = false;
+  let forwardQueue = Promise.resolve();
+
+  function enqueueForwardJob(job) {
+    const task = forwardQueue.catch(() => {}).then(() => forwardJob(job));
+    forwardQueue = task
+      .then(() => sleep(50))
+      .catch(() => {});
+    return task;
+  }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "FORWARD_TO_FB") {
-      forwardJob(message.job)
+      enqueueForwardJob(message.job)
         .then(() => sendResponse({ ok: true }))
         .catch((err) => sendResponse({ ok: false, error: err.message }));
       return true;
@@ -110,57 +118,51 @@
     const sentStorageKey = fbSentKey(job.messageId);
 
     if (!text && imageCount === 0) throw new Error("无内容可发送");
-    if (sessionStorage.getItem(sentStorageKey)) return;
-    if (sendKey && lastSentKey === sendKey) return;
-    if (sendInFlight) return;
+    if (!job.manual && sessionStorage.getItem(sentStorageKey)) return;
+    if (!job.manual && sendKey && lastSentKey === sendKey) return;
 
-    sendInFlight = true;
     const fast = !!job.manual;
-    try {
-      const composerWaitMs = job.coldStart
-        ? 14000
-        : fast
-          ? COMPOSER_WAIT_FAST_MS
-          : COMPOSER_WAIT_MS;
-      await waitForComposer(composerWaitMs, fast);
-      let composer = findComposer();
-      if (!composer) {
-        throw new Error("未找到输入框：请登录 Facebook，并确认已打开对应群聊页面");
-      }
-
-      if (imageCount) {
-        const files = [];
-        for (let i = 0; i < images.length; i++) {
-          try {
-            files.push(await imageRefToFile(images[i], `tg-${job.messageId}-${i}.jpg`));
-          } catch (err) {
-            console.warn("[tg-to-fb] image prepare failed", err);
-          }
-        }
-        if (!files.length && !text) {
-          throw new Error("图片上传失败：请确认 FB 群聊页已打开且已登录");
-        }
-        if (files.length) {
-          composer = findComposer() || composer;
-          await attachFilesOnce(files, composer, fast);
-          if (!text) {
-            lastSentKey = sendKey;
-            sessionStorage.setItem(sentStorageKey, String(Date.now()));
-            return;
-          }
-        }
-      }
-
-      composer = findComposer() || composer;
-      if (text) {
-        if (fast && job.textOnly) await typeAndSendInstant(composer, text);
-        else await typeAndSend(composer, text, fast);
-      }
-      lastSentKey = sendKey;
-      sessionStorage.setItem(sentStorageKey, String(Date.now()));
-    } finally {
-      sendInFlight = false;
+    const composerWaitMs = job.coldStart
+      ? 14000
+      : fast
+        ? COMPOSER_WAIT_FAST_MS
+        : COMPOSER_WAIT_MS;
+    await waitForComposer(composerWaitMs, fast);
+    let composer = findComposer();
+    if (!composer) {
+      throw new Error("未找到输入框：请登录 Facebook，并确认已打开对应群聊页面");
     }
+
+    if (imageCount) {
+      const files = [];
+      for (let i = 0; i < images.length; i++) {
+        try {
+          files.push(await imageRefToFile(images[i], `tg-${job.messageId}-${i}.jpg`));
+        } catch (err) {
+          console.warn("[tg-to-fb] image prepare failed", err);
+        }
+      }
+      if (!files.length && !text) {
+        throw new Error("图片上传失败：请确认 FB 群聊页已打开且已登录");
+      }
+      if (files.length) {
+        composer = findComposer() || composer;
+        await attachFilesOnce(files, composer, fast);
+        if (!text) {
+          lastSentKey = sendKey;
+          if (!job.manual) sessionStorage.setItem(sentStorageKey, String(Date.now()));
+          return;
+        }
+      }
+    }
+
+    composer = findComposer() || composer;
+    if (text) {
+      if (fast && job.textOnly) await typeAndSendInstant(composer, text);
+      else await typeAndSend(composer, text, fast);
+    }
+    lastSentKey = sendKey;
+    if (!job.manual) sessionStorage.setItem(sentStorageKey, String(Date.now()));
   }
 
   function isVisible(el) {

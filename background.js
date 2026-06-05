@@ -4,6 +4,7 @@ const DEFAULT_CONFIG = {
   enabled: false,
   watchUserName: "",
   watchUserNames: [],
+  watchSenderPeerKeys: [],
   knownSenders: [],
   telegramGroupId: "",
   fbThreadUrl: "",
@@ -33,6 +34,7 @@ const FB_TAB_QUERY_URLS = ["*://*.facebook.com/*", "*://facebook.com/*"];
 const FB_DELIVERY_LOCKS_KEY = "fbDeliveryLocks";
 const FB_DELIVERY_TTL_MS = 3 * 60 * 1000;
 const fbSendInFlight = new Set();
+const fbTabSendQueues = new Map();
 const TG_MONITOR_ALARM = "tgMonitor";
 const TG_HOME_URL = "https://web.telegram.org/a/";
 let processing = false;
@@ -190,6 +192,9 @@ function normalizeConfig(config) {
   config.watchUserNames = getWatchUserNames(config);
   if (config.watchUserNames.length) config.watchUserName = config.watchUserNames[0];
 
+  if (!Array.isArray(config.watchSenderPeerKeys)) config.watchSenderPeerKeys = [];
+  config.watchSenderPeerKeys = [...new Set(config.watchSenderPeerKeys.map((s) => String(s).trim()).filter(Boolean))];
+
   if (!Array.isArray(config.knownSenders)) config.knownSenders = [];
   config.knownSenders = [...new Set(config.knownSenders.map((s) => String(s).trim()).filter(Boolean))];
 
@@ -312,6 +317,9 @@ async function saveConfig(partial) {
   if (partial.watchUserNames !== undefined) {
     next.watchUserNames = (partial.watchUserNames || []).map((s) => String(s).trim()).filter(Boolean);
     next.watchUserName = next.watchUserNames[0] || "";
+  }
+  if (partial.watchSenderPeerKeys !== undefined) {
+    next.watchSenderPeerKeys = [...new Set((partial.watchSenderPeerKeys || []).map((s) => String(s).trim()).filter(Boolean))];
   }
   if (partial.filterRulesText !== undefined) {
     next.filterRules = mergeFilterRules(
@@ -791,7 +799,7 @@ async function sendJobToFacebook(job, target) {
       coldStart: job.manual ? false : coldStart,
     });
     if (res?.ok) {
-      await markDelivered(lockKey);
+      if (!job.manual) await markDelivered(lockKey);
       return { ...res, mode: "composer-tab" };
     }
     throw new Error(res?.error || "群聊页发送失败");
@@ -1397,7 +1405,18 @@ async function isFbMessageAlreadySent(tabId, messageId) {
   }
 }
 
-async function sendToFacebookTab(tabId, job) {
+function runInFbTabQueue(tabId, fn) {
+  const key = String(tabId);
+  const prev = fbTabSendQueues.get(key) || Promise.resolve();
+  const run = prev.catch(() => {}).then(() => fn());
+  fbTabSendQueues.set(
+    key,
+    run.catch(() => {})
+  );
+  return run;
+}
+
+async function sendToFacebookTabImpl(tabId, job) {
   if (!job.skipPreSentCheck && (await isFbMessageAlreadySent(tabId, job.messageId))) {
     return { ok: true, alreadySent: true };
   }
@@ -1413,7 +1432,7 @@ async function sendToFacebookTab(tabId, job) {
       fbContentInjected.delete(tabId);
       await injectFacebookContent(tabId);
       await sleep(job.manual ? 25 : 400);
-      if (await isFbMessageAlreadySent(tabId, job.messageId)) {
+      if (!job.manual && (await isFbMessageAlreadySent(tabId, job.messageId))) {
         return { ok: true, alreadySent: true };
       }
       const res = await chrome.tabs.sendMessage(tabId, { type: "FORWARD_TO_FB", job });
@@ -1428,6 +1447,10 @@ async function sendToFacebookTab(tabId, job) {
     return { ok: true, alreadySent: true };
   }
   throw lastErr || new Error("无法连接 Facebook 标签页");
+}
+
+async function sendToFacebookTab(tabId, job) {
+  return runInFbTabQueue(tabId, () => sendToFacebookTabImpl(tabId, job));
 }
 
 function sleep(ms) {
