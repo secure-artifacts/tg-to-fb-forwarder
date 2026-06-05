@@ -1,0 +1,42 @@
+name: Release Browser Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package Extension
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist/icons
+          cp manifest.json background.js telegram-content.js facebook-content.js \
+            fb-api-send.js filter.js image-dedupe.js popup.html popup.js popup.css dist/
+          cp icons/icon16.png icons/icon48.png icons/icon128.png dist/icons/
+
+          cd dist
+          zip -r ../tg-to-fb-forwarder-${{ github.ref_name }}.zip .
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: '*.zip'
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*.zip'
+          generate_release_notes: true

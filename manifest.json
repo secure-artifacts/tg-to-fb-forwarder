@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Telegram → Facebook 群消息转发",
+  "version": "1.9.8",
+  "description": "在 Telegram 标签页配置 FB 群，手动打开群聊页后转发消息",
+  "permissions": ["storage", "tabs", "alarms", "notifications", "scripting", "cookies"],
+  "host_permissions": [
+    "https://web.telegram.org/*",
+    "https://*.facebook.com/*",
+    "https://facebook.com/*",
+    "https://docs.google.com/*",
+    "https://upload.facebook.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "TG→FB 转发"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://web.telegram.org/*"
+      ],
+      "js": ["image-dedupe.js", "telegram-content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.facebook.com/*",
+        "https://facebook.com/*",
+        "https://m.facebook.com/*"
+      ],
+      "js": ["facebook-content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

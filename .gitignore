@@ -1,0 +1,8 @@
+.env
+.env.*
+node_modules/
+dist/
+__pycache__/
+.DS_Store
+*.zip
+Thumbs.db
