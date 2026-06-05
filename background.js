@@ -383,6 +383,15 @@ function isValidTelegramChatUrl(url) {
 }
 
 async function injectFacebookContent(tabId) {
+  try {
+    const res = await chrome.tabs.sendMessage(tabId, { type: "TGFB_PING" });
+    if (res?.ok) {
+      fbContentInjected.add(tabId);
+      return;
+    }
+  } catch {
+    /* script not ready */
+  }
   if (fbContentInjected.has(tabId)) return;
   try {
     await chrome.scripting.executeScript({
@@ -882,17 +891,41 @@ async function fetchImagesFromMessageInTelegram(messageId) {
           document.querySelector(`.Message [data-message-id="${mid}"]`)?.closest(".Message");
         if (!root) return [];
 
-        const containers = [
-          ...root.querySelectorAll(".media-inner, .Album, .Photo, .message-media, .message-content-media"),
-        ];
+        const isStickerMessage = () => {
+          if (root.querySelector(".sticker-media, video.sticker-media, .CustomEmoji, .custom-emoji")) {
+            return true;
+          }
+          if (root.querySelector("img.full-media, .Photo, .Album")) return false;
+          for (const inner of root.querySelectorAll(".media-inner")) {
+            if (inner.querySelector(".sticker-media, video.sticker-media")) return true;
+            if (inner.querySelector("canvas") && !inner.querySelector("img.full-media")) return true;
+          }
+          return false;
+        };
+        if (isStickerMessage()) return [];
+
+        const album = root.querySelector(".Album");
+        const containers = album
+          ? [...album.querySelectorAll(".media-inner")]
+          : [...root.querySelectorAll(".media-inner, .Photo, .message-media, .message-content-media")].filter(
+              (el, _i, all) => !all.some((other) => other !== el && other.contains(el))
+            );
+
         const candidates = [];
-        const pickLargest = (container) => {
+        const pickBest = (container) => {
           let best = null;
           let bestArea = 0;
+          let bestCanvas = null;
           for (const img of container.querySelectorAll("img")) {
             if (img.closest(".Avatar, .avatar, .Reactions")) continue;
+            if (img.classList.contains("sticker-media")) continue;
+            const src = (img.currentSrc || img.src || "").toLowerCase();
+            if (src.includes("sticker") || (src.includes("emoji") && !img.classList.contains("full-media"))) {
+              continue;
+            }
             const r = img.getBoundingClientRect();
-            if (r.width < 48 || r.height < 48) continue;
+            const min = album ? 20 : 48;
+            if (r.width < min || r.height < min) continue;
             const w = img.naturalWidth || r.width;
             const h = img.naturalHeight || r.height;
             const area = w * h;
@@ -901,9 +934,19 @@ async function fetchImagesFromMessageInTelegram(messageId) {
               best = img;
             }
           }
-          if (best) candidates.push(best);
+          if (best) {
+            candidates.push(best);
+            return;
+          }
+          for (const canvas of container.querySelectorAll("canvas.thumbnail, canvas")) {
+            if (canvas.width >= 8 && canvas.height >= 8) {
+              bestCanvas = canvas;
+              break;
+            }
+          }
+          if (bestCanvas) candidates.push(bestCanvas);
         };
-        if (containers.length) containers.forEach(pickLargest);
+        if (containers.length) containers.forEach(pickBest);
         else {
           for (const img of root.querySelectorAll("img.full-media, .media-inner img")) {
             if (img.closest(".Avatar, .avatar, .Reactions")) continue;
@@ -915,34 +958,40 @@ async function fetchImagesFromMessageInTelegram(messageId) {
         const seen = new Set();
         const out = [];
 
-        async function imgToData(img) {
+        async function nodeToData(node) {
+          if (node instanceof HTMLCanvasElement) {
+            if (!node.width || !node.height) return null;
+            return node.toDataURL("image/jpeg", 0.92);
+          }
           await new Promise((resolve) => {
-            if (img.complete && img.naturalWidth > 0) resolve();
+            if (node.complete && node.naturalWidth > 0) resolve();
             else {
-              img.onload = resolve;
-              img.onerror = resolve;
-              setTimeout(resolve, 1500);
+              node.onload = resolve;
+              node.onerror = resolve;
+              setTimeout(resolve, 2500);
             }
           });
-          const w = img.naturalWidth || img.width;
-          const h = img.naturalHeight || img.height;
+          const w = node.naturalWidth || node.width;
+          const h = node.naturalHeight || node.height;
           if (!w || !h) return null;
           const canvas = document.createElement("canvas");
           canvas.width = w;
           canvas.height = h;
-          canvas.getContext("2d").drawImage(img, 0, 0);
+          canvas.getContext("2d").drawImage(node, 0, 0);
           return canvas.toDataURL("image/jpeg", 0.92);
         }
 
-        for (const img of candidates) {
-          const r = img.getBoundingClientRect();
-          const src = img.currentSrc || img.src || "";
-          const key = src || `w${r.width}h${r.height}`;
+        for (const node of candidates) {
+          const r = node.getBoundingClientRect?.() || { width: 0, height: 0 };
+          const src = node.currentSrc || node.src || "";
+          const key = src || `w${r.width}h${r.height}:${out.length}`;
           if (seen.has(key)) continue;
           seen.add(key);
           try {
             let data = null;
-            if (src) {
+            if (node instanceof HTMLCanvasElement) {
+              data = await nodeToData(node);
+            } else if (src) {
               const res = await fetch(src);
               const blob = await res.blob();
               data = await new Promise((resolve, reject) => {
@@ -952,7 +1001,7 @@ async function fetchImagesFromMessageInTelegram(messageId) {
                 reader.readAsDataURL(blob);
               });
             } else {
-              data = await imgToData(img);
+              data = await nodeToData(node);
             }
             if (data) out.push(data);
           } catch {
@@ -965,7 +1014,7 @@ async function fetchImagesFromMessageInTelegram(messageId) {
       args: [messageId],
     });
     const list = Array.isArray(result) ? result : [];
-    return TgFbImageDedupe.pickSingleBestDataUrl(list);
+    return TgFbImageDedupe.dedupeImageRefs(list, 5);
   } catch {
     return [];
   }
@@ -1182,9 +1231,11 @@ function buildForwardText(payload) {
 }
 
 async function resolveJobImages(payload, albumSlots, manual = false) {
+  if (payload.isSticker) return [];
   let imageDataUrls = await resolvePayloadImages(payload);
   const urlFallback = TgFbImageDedupe.dedupeImageRefs(payload.imageUrls || [], 5);
-  const fetchTimeout = manual ? 1200 : 4500;
+  const slotCount = Math.min(5, Math.max(1, Number(albumSlots) || 1));
+  const fetchTimeout = manual ? Math.min(15000, 2000 + slotCount * 2000) : Math.min(22000, 4000 + slotCount * 3500);
 
   if (!imageDataUrls.length && urlFallback.length) {
     imageDataUrls = await Promise.race([
@@ -1386,6 +1437,25 @@ async function processQueue() {
   }
 }
 
+async function isFbManualJobAlreadySent(tabId, jobId) {
+  if (!tabId || !jobId) return false;
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (jid) => {
+        const m = location.pathname.match(/\/messages\/t\/(\d+)/i);
+        const tid = m?.[1] || "";
+        const guard = tid ? `${tid}::${jid}` : String(jid);
+        return !!sessionStorage.getItem(`tgfb_manual_done_${guard}`);
+      },
+      args: [String(jobId)],
+    });
+    return !!result;
+  } catch {
+    return false;
+  }
+}
+
 async function isFbMessageAlreadySent(tabId, messageId) {
   if (!tabId || !messageId) return false;
   try {
@@ -1429,10 +1499,12 @@ async function sendToFacebookTabImpl(tabId, job) {
   } catch (e) {
     lastErr = e;
     try {
-      fbContentInjected.delete(tabId);
       await injectFacebookContent(tabId);
-      await sleep(job.manual ? 25 : 400);
-      if (!job.manual && (await isFbMessageAlreadySent(tabId, job.messageId))) {
+      await sleep(job.manual ? 80 : 400);
+      if (await isFbMessageAlreadySent(tabId, job.messageId)) {
+        return { ok: true, alreadySent: true };
+      }
+      if (job.manual && (await isFbManualJobAlreadySent(tabId, job.id))) {
         return { ok: true, alreadySent: true };
       }
       const res = await chrome.tabs.sendMessage(tabId, { type: "FORWARD_TO_FB", job });

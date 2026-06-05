@@ -1,4 +1,7 @@
 (function () {
+  if (window.__TGFB_FB_CONTENT__) return;
+  window.__TGFB_FB_CONTENT__ = true;
+
   const SEND_DELAY_MS = 200;
   const SEND_DELAY_FAST_MS = 0;
   const COMPOSER_POLL_MS = 50;
@@ -10,6 +13,7 @@
 
   let lastSentKey = "";
   let forwardQueue = Promise.resolve();
+  const sendGuardKeys = new Set();
 
   function enqueueForwardJob(job) {
     const task = forwardQueue.catch(() => {}).then(() => forwardJob(job));
@@ -20,6 +24,10 @@
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "TGFB_PING") {
+      sendResponse({ ok: true });
+      return true;
+    }
     if (message?.type === "FORWARD_TO_FB") {
       enqueueForwardJob(message.job)
         .then(() => sendResponse({ ok: true }))
@@ -101,12 +109,24 @@
     return [best];
   }
 
+  function buildJobGuardKey(job) {
+    return `${getThreadIdFromPage()}::${job.id || job.messageId}`;
+  }
+
   async function forwardJob(job) {
     if (!job) throw new Error("无效任务");
     if (!/facebook\.com/i.test(location.hostname)) {
       throw new Error("当前页面不是 Facebook，请检查群链接");
     }
 
+    const guardKey = buildJobGuardKey(job);
+    const manualDoneKey = `tgfb_manual_done_${guardKey}`;
+    if (sendGuardKeys.has(guardKey) || (job.manual && sessionStorage.getItem(manualDoneKey))) {
+      return;
+    }
+    sendGuardKeys.add(guardKey);
+
+    try {
     let text = collapseRepeatedString(job.text || "");
     const albumSlots = Math.min(5, Math.max(1, Number(job.albumSlots) || 1));
     const merged = [...(job.imageDataUrls || []), ...(job.imageUrls || [])];
@@ -150,7 +170,7 @@
         await attachFilesOnce(files, composer, fast);
         if (!text) {
           lastSentKey = sendKey;
-          if (!job.manual) sessionStorage.setItem(sentStorageKey, String(Date.now()));
+          markJobSent(job, sentStorageKey, manualDoneKey);
           return;
         }
       }
@@ -162,7 +182,18 @@
       else await typeAndSend(composer, text, fast);
     }
     lastSentKey = sendKey;
-    if (!job.manual) sessionStorage.setItem(sentStorageKey, String(Date.now()));
+    markJobSent(job, sentStorageKey, manualDoneKey);
+    } finally {
+      setTimeout(() => sendGuardKeys.delete(guardKey), 8000);
+    }
+  }
+
+  function markJobSent(job, sentStorageKey, manualDoneKey) {
+    if (job.manual) {
+      sessionStorage.setItem(manualDoneKey, String(Date.now()));
+      return;
+    }
+    sessionStorage.setItem(sentStorageKey, String(Date.now()));
   }
 
   function isVisible(el) {
@@ -431,9 +462,16 @@
     }
   }
 
+  function sendButtonReady(composer) {
+    const btn = findSendButtonNear(composer);
+    if (!(btn instanceof HTMLElement) || !isVisible(btn)) return false;
+    if (btn.getAttribute("aria-disabled") === "true" || btn.hasAttribute("disabled")) return false;
+    return true;
+  }
+
   async function confirmSendOnce(composer, fast = false) {
     const c = findComposer() || composer;
-    if (!c) return false;
+    if (!c || !sendButtonReady(c)) return false;
     if (await clickSendButton(c)) return true;
     await sendEnterKey(c);
     await sleep(fast ? 80 : 200);
@@ -463,10 +501,9 @@
       const dt = new DataTransfer();
       for (const file of uploadFiles) dt.items.add(file);
       input.files = dt.files;
-      input.dispatchEvent(new Event("input", { bubbles: true }));
       input.dispatchEvent(new Event("change", { bubbles: true }));
       await sleep(imgWait);
-      await confirmSendOnce(target, fast);
+      if (sendButtonReady(target)) await confirmSendOnce(target, fast);
       return;
     }
 

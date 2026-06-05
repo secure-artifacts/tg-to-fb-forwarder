@@ -139,7 +139,7 @@
 
   function collectPeerKeysForSender(targetName) {
     const keys = new Set();
-    const ctx = { lastSender: "", lastPeerKey: "", peerNames: new Map() };
+    const ctx = { lastSender: "", lastStablePeer: "", peerNames: new Map() };
     const target = normalizeSenderName(targetName);
     if (!target) return [];
 
@@ -147,18 +147,13 @@
       const msg = normalizeMessageEl(raw);
       if (isOwnMessage(msg)) {
         ctx.lastSender = "";
-        ctx.lastPeerKey = "";
+        ctx.lastStablePeer = "";
         continue;
       }
       const sender = normalizeSenderName(resolveMessageSender(msg, ctx) || "");
-      if (sender) ctx.lastSender = sender;
-      const peerKey = extractSenderPeerKey(getMessageListItem(msg));
-      if (peerKey) ctx.lastPeerKey = peerKey;
-
-      if (senderMatches(sender, [target])) {
-        if (peerKey) keys.add(peerKey);
-        if (ctx.lastPeerKey) keys.add(ctx.lastPeerKey);
-      }
+      if (!senderMatches(sender, [target])) continue;
+      const stablePeer = extractStablePeerKey(getMessageListItem(msg));
+      if (stablePeer) keys.add(stablePeer);
     }
     return [...keys];
   }
@@ -171,54 +166,32 @@
     return [...keys];
   }
 
-  function isMessageWatched(sender, peerKey, watchList, watchPeers) {
-    const peerSet = watchPeers instanceof Set ? watchPeers : new Set(watchPeers || []);
-    if (sender && senderMatches(sender, watchList)) return true;
-    if (peerKey && peerSet.has(peerKey)) return true;
-    return false;
-  }
-
-  function syncMessageCheckboxesFromWalk(watchList, watchPeers) {
-    const peerSet = new Set(watchPeers || []);
-    const ctx = { lastSender: "", lastPeerKey: "", peerNames: new Map() };
+  function syncMessageCheckboxesFromWalk(watchList) {
+    const ctx = { lastSender: "", lastStablePeer: "", peerNames: new Map() };
 
     for (const raw of findMessageNodes()) {
       const msg = normalizeMessageEl(raw);
       if (isOwnMessage(msg)) {
         ctx.lastSender = "";
-        ctx.lastPeerKey = "";
+        ctx.lastStablePeer = "";
         continue;
       }
 
       const sender = normalizeSenderName(resolveMessageSender(msg, ctx) || "");
-      if (sender) ctx.lastSender = sender;
-      const peerKey = extractSenderPeerKey(getMessageListItem(msg));
-      if (peerKey) ctx.lastPeerKey = peerKey;
-
-      const byName = sender && senderMatches(sender, watchList);
-      const byPeer = peerKey && peerSet.has(peerKey);
-      const byGroupPeer =
-        !byName &&
-        !byPeer &&
-        isGroupedContinuation(msg) &&
-        ctx.lastPeerKey &&
-        peerSet.has(ctx.lastPeerKey) &&
-        ctx.lastSender &&
-        senderMatches(ctx.lastSender, watchList);
-      const checked = byName || byPeer || byGroupPeer;
-
       const wrap = msg.querySelector(`.${CHECK_CLASS}`);
       if (!wrap) continue;
 
-      const labelName = sender || ctx.lastSender || wrap.dataset.sender || "未知";
-      if (labelName !== "未知") {
-        wrap.dataset.sender = labelName;
-        const cb = wrap.querySelector(".tgfb-cb");
-        if (cb) {
-          cb.dataset.sender = labelName;
-          cb.checked = checked;
-          wrap.querySelector("label")?.setAttribute("title", `勾选后自动转发「${labelName}」`);
-        }
+      const cb = wrap.querySelector(".tgfb-cb");
+      if (!sender || !isLikelySenderName(sender)) {
+        if (cb) cb.checked = false;
+        continue;
+      }
+
+      wrap.dataset.sender = sender;
+      if (cb) {
+        cb.dataset.sender = sender;
+        cb.checked = senderMatches(sender, watchList);
+        wrap.querySelector("label")?.setAttribute("title", `勾选后自动转发「${sender}」`);
       }
     }
   }
@@ -264,10 +237,35 @@
     return msg.closest(".message-list-item") || msg;
   }
 
+  function isEmbeddedReplyScope(el) {
+    return !!el?.closest?.(".EmbeddedMessage, .message-subheader");
+  }
+
+  function extractSenderFromVisibleTitle(msg) {
+    const content = msg.querySelector(".message-content");
+    if (!content) return "";
+
+    for (const title of content.querySelectorAll(".message-title")) {
+      if (isEmbeddedReplyScope(title)) continue;
+      const senderEl = title.querySelector(".sender-title, .message-title-name");
+      const t = (senderEl?.textContent || "").trim();
+      if (isLikelySenderName(t)) return normalizeSenderName(t);
+    }
+
+    for (const node of content.querySelectorAll(".sender-title")) {
+      if (isEmbeddedReplyScope(node)) continue;
+      const t = node.textContent?.trim();
+      if (isLikelySenderName(t)) return normalizeSenderName(t);
+    }
+
+    return "";
+  }
+
   function isFirstInGroup(msg) {
+    if (extractSenderFromVisibleTitle(msg)) return true;
     const sub = msg.querySelector(".message-subheader");
     if (sub) {
-      for (const sel of [".sender-title", ".message-title", ".peer-title"]) {
+      for (const sel of [".sender-title", ".peer-title"]) {
         const t = sub.querySelector(sel)?.textContent?.trim();
         if (isLikelySenderName(t)) return true;
       }
@@ -313,7 +311,7 @@
     return [...byId.values()];
   }
 
-  function extractSenderPeerKey(listItem) {
+  function extractStablePeerKey(listItem) {
     const av = findAvatarInListItem(listItem);
     if (!av) return "";
     const peer =
@@ -326,13 +324,23 @@
     if (img?.src && !img.src.startsWith("data:")) {
       try {
         const u = new URL(img.src, location.origin);
-        return `img:${u.pathname}`;
+        if (u.pathname && u.pathname.length > 1) return `img:${u.pathname}`;
       } catch {
-        return `img:${img.src.split("?")[0]}`;
+        const path = img.src.split("?")[0];
+        if (path) return `img:${path}`;
       }
     }
+    return "";
+  }
+
+  function extractSenderPeerKey(listItem) {
+    const stable = extractStablePeerKey(listItem);
+    if (stable) return stable;
+    const av = findAvatarInListItem(listItem);
+    if (!av) return "";
+    const img = av.querySelector("img");
     const label = (img?.alt || av.getAttribute("aria-label") || av.title || "").trim();
-    if (label && label.length < 80) return `name:${label.toLowerCase()}`;
+    if (label && isLikelySenderName(label)) return `name:${normalizeSenderName(label).toLowerCase()}`;
     return "";
   }
 
@@ -349,84 +357,94 @@
     return "";
   }
 
-  function rememberPeerName(ctx, peerKey, name) {
-    if (!peerKey || !name || name === "未知") return;
+  function rememberPeerName(ctx, stablePeer, name) {
+    if (!stablePeer || !name || name === "未知") return;
     if (!ctx.peerNames) ctx.peerNames = new Map();
-    const prev = ctx.peerNames.get(peerKey);
-    if (!prev || name.length < prev.length) ctx.peerNames.set(peerKey, name);
+    ctx.peerNames.set(stablePeer, name);
   }
 
-  function nameFromPeer(ctx, peerKey) {
-    if (!peerKey || !ctx.peerNames) return "";
-    return ctx.peerNames.get(peerKey) || "";
+  function nameFromStablePeer(ctx, stablePeer) {
+    if (!stablePeer || !ctx.peerNames) return "";
+    return ctx.peerNames.get(stablePeer) || "";
+  }
+
+  function sameSpeakerGroup(ctx, stablePeer) {
+    if (!ctx.lastSender) return false;
+    if (stablePeer && ctx.lastStablePeer) return stablePeer === ctx.lastStablePeer;
+    if (!stablePeer && !ctx.lastStablePeer) return true;
+    return false;
   }
 
   function resolveMessageSender(el, ctx) {
     const msg = normalizeMessageEl(el);
     const listItem = getMessageListItem(msg);
-    const peerKey = extractSenderPeerKey(listItem);
+    const stablePeer = extractStablePeerKey(listItem);
     const direct = extractSender(msg, listItem);
 
+    if (stablePeer && ctx.lastStablePeer && stablePeer !== ctx.lastStablePeer) {
+      ctx.lastStablePeer = stablePeer;
+      ctx.lastSender = "";
+    }
+
     if (direct) {
-      rememberPeerName(ctx, peerKey, direct);
-      if (peerKey) ctx.lastPeerKey = peerKey;
+      rememberPeerName(ctx, stablePeer, direct);
+      if (stablePeer) ctx.lastStablePeer = stablePeer;
       ctx.lastSender = direct;
       return direct;
     }
 
-    if (peerKey && ctx.lastPeerKey && peerKey !== ctx.lastPeerKey) {
-      ctx.lastPeerKey = peerKey;
-      ctx.lastSender = "";
-    }
-
-    const peerName = nameFromPeer(ctx, peerKey);
-    if (peerName) {
-      ctx.lastSender = peerName;
-      if (peerKey) ctx.lastPeerKey = peerKey;
-      return peerName;
+    if (stablePeer) {
+      const peerName = nameFromStablePeer(ctx, stablePeer);
+      if (peerName) {
+        ctx.lastStablePeer = stablePeer;
+        ctx.lastSender = peerName;
+        return peerName;
+      }
     }
 
     if (isFirstInGroup(msg)) {
       const fromPrev = findSenderFromPreviousMessages(msg);
       if (fromPrev) {
-        rememberPeerName(ctx, peerKey, fromPrev);
+        rememberPeerName(ctx, stablePeer, fromPrev);
         ctx.lastSender = fromPrev;
+        if (stablePeer) ctx.lastStablePeer = stablePeer;
         return fromPrev;
       }
+      ctx.lastSender = "";
       return "";
     }
 
-    if (isGroupedContinuation(msg) && ctx.lastSender) {
-      if (!peerKey || !ctx.lastPeerKey || peerKey === ctx.lastPeerKey) {
-        rememberPeerName(ctx, peerKey, ctx.lastSender);
-        return ctx.lastSender;
-      }
+    if (isGroupedContinuation(msg) && ctx.lastSender && sameSpeakerGroup(ctx, stablePeer)) {
+      rememberPeerName(ctx, stablePeer, ctx.lastSender);
+      return ctx.lastSender;
     }
 
-    if (ctx.lastSender && (!peerKey || peerKey === ctx.lastPeerKey)) {
-      rememberPeerName(ctx, peerKey, ctx.lastSender);
+    if (ctx.lastSender && sameSpeakerGroup(ctx, stablePeer)) {
+      rememberPeerName(ctx, stablePeer, ctx.lastSender);
       return ctx.lastSender;
     }
 
     const fromPrev = findSenderFromPreviousMessages(msg);
     if (fromPrev) {
-      rememberPeerName(ctx, peerKey, fromPrev);
+      rememberPeerName(ctx, stablePeer, fromPrev);
       ctx.lastSender = fromPrev;
+      if (stablePeer) ctx.lastStablePeer = stablePeer;
+      return fromPrev;
     }
-    return fromPrev;
+    return "";
   }
 
   /** 按 DOM 顺序遍历，补全群聊里“不重复显示昵称”的发送者 */
   function walkMessagesWithSender() {
     const nodes = findMessageNodes();
-    const ctx = { lastSender: "", lastPeerKey: "", peerNames: new Map() };
+    const ctx = { lastSender: "", lastStablePeer: "", peerNames: new Map() };
     const result = [];
 
     for (const raw of nodes) {
       const el = normalizeMessageEl(raw);
       if (isOwnMessage(el)) {
         ctx.lastSender = "";
-        ctx.lastPeerKey = "";
+        ctx.lastStablePeer = "";
         continue;
       }
       const sender = resolveMessageSender(el, ctx);
@@ -441,23 +459,23 @@
     try {
       const byPeer = new Map();
       const orphan = new Set();
-      const ctx = { lastSender: "", lastPeerKey: "", peerNames: new Map() };
+      const ctx = { lastSender: "", lastStablePeer: "", peerNames: new Map() };
 
       for (const raw of findMessageNodes()) {
         const msg = normalizeMessageEl(raw);
         if (isOwnMessage(msg)) {
           ctx.lastSender = "";
-          ctx.lastPeerKey = "";
+          ctx.lastStablePeer = "";
           continue;
         }
         const listItem = getMessageListItem(msg);
-        const peerKey = extractSenderPeerKey(listItem);
         const sender = resolveMessageSender(msg, ctx);
         if (!sender || sender === "未知" || !isLikelySenderName(sender)) continue;
 
-        if (peerKey && !peerKey.startsWith("name:")) {
-          const prev = byPeer.get(peerKey);
-          if (!prev || sender.length < prev.length) byPeer.set(peerKey, sender);
+        const stablePeer = extractStablePeerKey(listItem);
+        if (stablePeer) {
+          const prev = byPeer.get(stablePeer);
+          if (!prev || sender.length < prev.length) byPeer.set(stablePeer, sender);
         } else {
           orphan.add(sender);
         }
@@ -593,11 +611,8 @@
   }
 
   function markSenderMessagesSeen(senderName) {
-    const watchPeers = new Set(collectPeerKeysForSender(senderName));
     for (const { el, sender } of walkMessagesWithSender()) {
-      const msg = normalizeMessageEl(el);
-      const peerKey = extractSenderPeerKey(getMessageListItem(msg));
-      if (!isMessageWatched(sender, peerKey, [senderName], watchPeers)) continue;
+      if (!senderMatches(sender, [senderName])) continue;
       const id = getMessageId(el);
       if (id) seenIds.add(id);
     }
@@ -655,18 +670,8 @@
     const msg = normalizeMessageEl(el);
     const scope = listItem || getMessageListItem(msg);
 
-    const sub = msg.querySelector(".message-subheader");
-    if (sub) {
-      for (const sel of [".sender-title", ".message-title", ".peer-title", ".message-author"]) {
-        const node = sub.querySelector(sel);
-        const t = node?.textContent?.trim();
-        if (isLikelySenderName(t)) return normalizeSenderName(t);
-      }
-      for (const node of sub.querySelectorAll(":scope > a, :scope > span")) {
-        const t = node.textContent?.trim();
-        if (isLikelySenderName(t)) return normalizeSenderName(t);
-      }
-    }
+    const fromTitle = extractSenderFromVisibleTitle(msg);
+    if (fromTitle) return fromTitle;
 
     const avatar = findAvatarInListItem(scope);
     if (avatar) {
@@ -674,6 +679,15 @@
       if (isLikelySenderName(img?.alt)) return normalizeSenderName(img.alt);
       const aria = avatar.getAttribute("aria-label") || avatar.title;
       if (isLikelySenderName(aria)) return normalizeSenderName(aria);
+    }
+
+    const sub = msg.querySelector(".message-subheader");
+    if (sub) {
+      for (const sel of [".sender-title", ".peer-title", ".message-author"]) {
+        const node = sub.querySelector(sel);
+        const t = node?.textContent?.trim();
+        if (isLikelySenderName(t)) return normalizeSenderName(t);
+      }
     }
 
     return "";
@@ -763,8 +777,7 @@
   function syncExistingCheckboxSender(msg, sender) {
     const wrap = msg.querySelector(`.${CHECK_CLASS}`);
     const name = normalizeSenderName(sender);
-    if (!wrap || !name || name === "未知") return;
-    if (wrap.dataset.sender === name) return;
+    if (!wrap || !name || name === "未知" || !isLikelySenderName(name)) return;
     wrap.dataset.sender = name;
     const cb = wrap.querySelector(".tgfb-cb");
     if (cb) {
@@ -848,13 +861,13 @@
   function injectMessageCheckboxes(opts = {}) {
     let injected = 0;
     const nodes = findMessageNodes();
-    const ctx = { lastSender: "", lastPeerKey: "", peerNames: new Map() };
+    const ctx = { lastSender: "", lastStablePeer: "", peerNames: new Map() };
 
     for (const raw of nodes) {
       const msg = normalizeMessageEl(raw);
       if (isOwnMessage(msg)) {
         ctx.lastSender = "";
-        ctx.lastPeerKey = "";
+        ctx.lastStablePeer = "";
         continue;
       }
 
@@ -926,8 +939,7 @@
   function syncAllCheckboxes(force = false) {
     if (!force && Date.now() < senderSyncPausedUntil) return;
     const list = getWatchList();
-    const peers = getWatchPeerKeys();
-    syncMessageCheckboxesFromWalk(list, peers);
+    syncMessageCheckboxesFromWalk(list);
     document.querySelectorAll(".tgfb-picker-cb").forEach((cb) => {
       const sender = getSenderFromControl(cb);
       if (sender) cb.checked = senderMatches(sender, list);
@@ -957,24 +969,158 @@
   }
 
   function messageHasMediaShell(msg) {
-    return !!msg.querySelector(
-      ".media-inner, .Album, .Photo, .Video, .RoundVideo, img.full-media, canvas.thumbnail, .message-media, .message-content-media, .Attachment, .document-container, .File, .WebPage--with-photo"
+    for (const scope of getAlbumScopeMessages(msg)) {
+      if (
+        scope.querySelector(
+          ".media-inner, .Album, .Photo, .Video, .RoundVideo, img.full-media, canvas.thumbnail, .message-media, .message-content-media, .Attachment, .document-container, .File, .WebPage--with-photo"
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function isAlbumMessage(msg) {
+    const root = normalizeMessageEl(msg);
+    return !!(
+      root.classList.contains("is-album") ||
+      root.querySelector(".Album") ||
+      root.classList.contains("is-in-document-group") ||
+      root.classList.contains("first-in-document-group")
     );
+  }
+
+  function isDocumentGroupContinuation(msg) {
+    const root = normalizeMessageEl(msg);
+    return root.classList.contains("is-in-document-group") && !root.classList.contains("first-in-document-group");
+  }
+
+  /** 相册/多图：合并同组消息或单条内的多个格子 */
+  function getAlbumScopeMessages(msg) {
+    const root = normalizeMessageEl(msg);
+    if (!root) return [];
+
+    if (root.classList.contains("is-album") || root.querySelector(".Album")) {
+      return [root];
+    }
+
+    const item = getMessageListItem(root);
+    const parent = item?.parentElement;
+    if (!parent) return [root];
+
+    const items = [...parent.querySelectorAll(".message-list-item")];
+    const idx = items.indexOf(item);
+    if (idx < 0) return [root];
+
+    const msgAt = (el) => normalizeMessageEl(el.querySelector?.(".Message") || el);
+    const inDocGroup = (m) =>
+      m.classList.contains("is-in-document-group") ||
+      m.classList.contains("first-in-document-group") ||
+      m.classList.contains("last-in-document-group");
+
+    if (!inDocGroup(root)) return [root];
+
+    let start = idx;
+    for (let i = idx - 1; i >= 0; i--) {
+      if (inDocGroup(msgAt(items[i]))) start = i;
+      else break;
+    }
+
+    const out = [];
+    for (let i = start; i < items.length; i++) {
+      const m = msgAt(items[i]);
+      if (i > start && !inDocGroup(m)) break;
+      if (inDocGroup(m)) out.push(m);
+      if (out.length >= 10) break;
+    }
+    return out.length ? out : [root];
+  }
+
+  /** TG 贴纸/动态表情（非普通照片），转发到 FB 会变成黑块 */
+  function isStickerMessage(msg) {
+    const root = normalizeMessageEl(msg);
+    if (!root) return false;
+
+    if (root.querySelector(".sticker-media, video.sticker-media, .CustomEmoji, .custom-emoji")) {
+      return true;
+    }
+
+    const content = root.querySelector(".message-content");
+    if (content?.classList.contains("emoji-only") && content.querySelector(".CustomEmoji, .custom-emoji")) {
+      return true;
+    }
+
+    const mediaInners = root.querySelectorAll(".media-inner");
+    if (!mediaInners.length) return false;
+
+    const hasForwardablePhoto = !!root.querySelector(
+      "img.full-media, .Photo, .Album, .WebPage--with-photo img.full-media"
+    );
+    if (hasForwardablePhoto) return false;
+
+    for (const inner of mediaInners) {
+      if (isStickerMediaContainer(inner, root)) return true;
+    }
+    return false;
+  }
+
+  function isStickerMediaContainer(container, msg) {
+    if (!(container instanceof Element)) return false;
+    if (container.querySelector(".sticker-media, video.sticker-media")) return true;
+    if (container.querySelector("img.full-media, .Photo")) return false;
+
+    const imgs = container.querySelectorAll("img");
+    if (imgs.length && [...imgs].every((img) => isStickerImage(img, msg))) return true;
+
+    if (container.querySelector("canvas") && !container.querySelector("img.full-media")) return true;
+    return false;
+  }
+
+  function isStickerImage(img, msg) {
+    if (!(img instanceof HTMLImageElement)) return false;
+    if (img.classList.contains("sticker-media")) return true;
+    const src = (img.currentSrc || img.src || "").toLowerCase();
+    if (/\/sticker[s]?\//i.test(src) || /[?&]sticker/i.test(src)) return true;
+    if (src.includes("emoji") && !img.classList.contains("full-media")) return true;
+    const inner = img.closest(".media-inner");
+    if (inner && isStickerMediaContainer(inner, msg) && !img.classList.contains("full-media")) return true;
+    return false;
+  }
+
+  function messageHasForwardableMedia(msg) {
+    if (isStickerMessage(msg)) return false;
+    return messageHasMediaShell(msg);
   }
 
   function scheduleMediaForwardRetry(msg, sender, messageId) {
     if (mediaRetryScheduled.has(messageId) || seenIds.has(messageId)) return;
     mediaRetryScheduled.add(messageId);
+    const delay = isAlbumMessage(msg) ? 3500 : 2000;
     setTimeout(() => {
       if (seenIds.has(messageId)) return;
       processMessageForward(msg, sender, messageId, true);
-    }, 2000);
+    }, delay);
   }
 
   function processMessageForward(msg, sender, messageId, options) {
     const { isRetry, manual, btn } = normalizeForwardOptions(options);
     if (forwardingIds.has(messageId)) return;
     if (!manual && seenIds.has(messageId)) return;
+
+    if (isStickerMessage(msg)) {
+      const caption = extractMessageText(msg).trim();
+      if (!caption) {
+        if (!manual) seenIds.add(messageId);
+        resetForwardNowButton(btn);
+        if (manual) {
+          updateBarStatus("表情包无法转发到 Facebook（已跳过）", "err");
+          showForwardStatus({ text: "表情包无法转发到 Facebook", level: "err" });
+        }
+        return;
+      }
+    }
+
     forwardingIds.add(messageId);
 
     if (manual) {
@@ -982,7 +1128,7 @@
       const hint = pending > 1 ? `手动转发中（${pending} 条排队）…` : "手动转发中…";
       updateBarStatus(hint);
       showForwardStatus({ text: hint, level: "info" });
-    } else if (messageHasMediaShell(msg)) {
+    } else if (messageHasForwardableMedia(msg)) {
       const hint = isRetry ? "图片重试中…" : "检测到图片，处理中…";
       updateBarStatus(hint);
       showForwardStatus({ text: hint, level: "info" });
@@ -1000,13 +1146,16 @@
         if (!hasContent) {
           forwardingIds.delete(messageId);
           resetForwardNowButton(btn);
-          if (!isRetry && !manual && messageHasMediaShell(msg)) {
+          if (!isRetry && !manual && messageHasForwardableMedia(msg)) {
             updateBarStatus("图片加载中，稍后自动重试…");
             scheduleMediaForwardRetry(msg, sender, messageId);
-          } else if (messageHasMediaShell(msg)) {
-            updateBarStatus("未识别到图片：请在 TG 中点开图片预览后再试", "err");
+          } else if (messageHasForwardableMedia(msg)) {
+            const albumHint = isAlbumMessage(msg) ? "相册图片加载中，请稍候或点开预览后重试" : "未识别到图片：请在 TG 中点开图片预览后再试";
+            updateBarStatus(albumHint, "err");
           } else if (manual) {
             updateBarStatus("本条无文字/图片可转发", "err");
+          } else if (!manual && isStickerMessage(msg)) {
+            seenIds.add(messageId);
           }
           return;
         }
@@ -1032,13 +1181,15 @@
                         : res.reason || "跳过";
             const skipMsg = manual ? `手动转发失败：${reason}` : `未转发：${reason}`;
             updateBarStatus(skipMsg, res.reason === "filtered" || res.reason === "empty" ? "err" : undefined);
-            if (payload.hasImages || messageHasMediaShell(msg) || manual) {
+            if (payload.hasImages || messageHasForwardableMedia(msg) || manual) {
               showForwardStatus({ text: skipMsg, level: "err" });
             }
             forwardingIds.delete(messageId);
             if (!manual && res.reason === "duplicate") seenIds.add(messageId);
-            if (!manual && res.reason === "empty" && messageHasMediaShell(msg) && !isRetry) {
+            if (!manual && res.reason === "empty" && messageHasForwardableMedia(msg) && !isRetry) {
               scheduleMediaForwardRetry(msg, sender, messageId);
+            } else if (!manual && res.reason === "empty" && isStickerMessage(msg)) {
+              seenIds.add(messageId);
             }
             return;
           }
@@ -1072,18 +1223,20 @@
 
   function scanNewMessages() {
     const watchList = getWatchList();
-    const watchPeers = getWatchPeerKeys();
-    if (!config?.enabled || (!watchList.length && !watchPeers.length)) return;
+    if (!config?.enabled || !watchList.length) return;
     if (!getFbUrlsText().trim()) return;
 
     for (const { el, sender } of walkMessagesWithSender()) {
       const messageId = getMessageId(el);
       if (!messageId || seenIds.has(messageId) || forwardingIds.has(messageId)) continue;
+      if (!sender || !senderMatches(sender, watchList)) continue;
 
       const msg = normalizeMessageEl(el);
-      const peerKey = extractSenderPeerKey(getMessageListItem(msg));
-      if (!isMessageWatched(sender, peerKey, watchList, watchPeers)) continue;
       if (isServiceMessage(msg)) {
+        seenIds.add(messageId);
+        continue;
+      }
+      if (isDocumentGroupContinuation(msg)) {
         seenIds.add(messageId);
         continue;
       }
@@ -1244,20 +1397,45 @@
     return [...new Set(links)];
   }
 
+  function isAlbumMediaContext(img, msg) {
+    return !!(
+      msg.classList.contains("is-album") ||
+      img.closest(".Album, .is-album") ||
+      msg.classList.contains("is-in-document-group") ||
+      msg.classList.contains("first-in-document-group")
+    );
+  }
+
   function isMediaImage(img, msg) {
     if (!msg || !msg.contains(img)) return false;
     if (img.closest(`.Avatar, .avatar, .Reactions, .MessageMeta, .message-subheader, .${CHECK_CLASS}`)) {
       return false;
     }
+    if (isStickerImage(img, msg)) return false;
+
     if (img.classList.contains("full-media")) return true;
-    if (img.closest(".media-inner, .Album, .Photo, .Media, .message-media, .content-image")) return true;
 
     const src = (img.currentSrc || img.src || "").toLowerCase();
     if (src && (src.includes("emoji") || src.includes("sticker") || src.includes("blank"))) return false;
 
+    const mediaParent = img.closest(".media-inner, .Album, .Photo, .Media, .message-media, .content-image");
+    if (mediaParent) {
+      if (isStickerMediaContainer(mediaParent, msg)) return false;
+      return true;
+    }
+
+    const minSize = isAlbumMediaContext(img, msg) ? 20 : 56;
     const r = img.getBoundingClientRect();
-    if (r.width >= 56 && r.height >= 56) return true;
+    if (r.width >= minSize && r.height >= minSize) return true;
     return false;
+  }
+
+  function isMediaCanvas(canvas, msg) {
+    if (!(canvas instanceof HTMLCanvasElement) || !msg?.contains(canvas)) return false;
+    if (canvas.closest(`.Avatar, .avatar, .Reactions, .${CHECK_CLASS}`)) return false;
+    const parent = canvas.closest(".media-inner, .Album, .Photo, .message-media");
+    if (!parent || isStickerMediaContainer(parent, msg)) return false;
+    return canvas.width >= 8 && canvas.height >= 8;
   }
 
   function addImageItem(items, seen, img, msg) {
@@ -1281,32 +1459,63 @@
     return img.currentSrc || img.src || "";
   }
 
-  function pickLargestImageInContainer(container, msg, items, seen) {
+  function addCanvasItem(items, seen, canvas, msg) {
+    if (!isMediaCanvas(canvas, msg)) return;
+    const key = `canvas:${canvas.width}x${canvas.height}:${items.length}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    items.push({ url: "", img: canvas, isCanvas: true });
+  }
+
+  function pickBestMediaInContainer(container, msg, items, seen) {
     let best = null;
     let bestArea = 0;
     for (const img of container.querySelectorAll("img")) {
       if (!isMediaImage(img, msg)) continue;
-      const w = img.naturalWidth || img.offsetWidth || 0;
-      const h = img.naturalHeight || img.offsetHeight || 0;
+      const r = img.getBoundingClientRect();
+      const w = img.naturalWidth || img.offsetWidth || r.width || 0;
+      const h = img.naturalHeight || img.offsetHeight || r.height || 0;
       const area = w * h;
       if (area >= bestArea) {
         bestArea = area;
         best = img;
       }
     }
-    if (best) addImageItem(items, seen, best, msg);
+    if (best) {
+      addImageItem(items, seen, best, msg);
+      return;
+    }
+    for (const canvas of container.querySelectorAll("canvas.thumbnail, canvas.full-media, canvas")) {
+      addCanvasItem(items, seen, canvas, msg);
+      if (items.length) return;
+    }
   }
 
   function getLeafMediaContainers(msg) {
-    const all = [
-      ...msg.querySelectorAll(".media-inner, .message-media, .Photo, .message-content-media"),
-    ];
+    const album = msg.querySelector(".Album");
+    const roots = album
+      ? [...album.querySelectorAll(".media-inner")]
+      : [...msg.querySelectorAll(".media-inner, .message-media, .Photo, .message-content-media")];
+    const all = roots.filter((el) => !isStickerMediaContainer(el, msg));
     return all.filter((el) => !all.some((other) => other !== el && other.contains(el)));
   }
 
+  function getAlbumMediaContainers(msg) {
+    const containers = [];
+    for (const scope of getAlbumScopeMessages(msg)) {
+      containers.push(...getLeafMediaContainers(scope));
+    }
+    return containers;
+  }
+
   function countAlbumSlots(msg) {
-    const slots = getLeafMediaContainers(msg);
-    return slots.length > 1 ? Math.min(5, slots.length) : 1;
+    const containers = getAlbumMediaContainers(msg);
+    if (containers.length > 1) return Math.min(5, containers.length);
+    if (isAlbumMessage(msg)) {
+      const n = msg.querySelectorAll(".Album .media-inner, .is-album .media-inner").length;
+      if (n > 1) return Math.min(5, n);
+    }
+    return 1;
   }
 
   function collapseImageItems(items) {
@@ -1325,15 +1534,23 @@
   function collectMessageImages(msg) {
     const items = [];
     const seen = new Set();
-    const containers = getLeafMediaContainers(msg);
+    const scopes = getAlbumScopeMessages(msg);
+    const containers = getAlbumMediaContainers(msg);
 
     if (containers.length) {
-      containers.forEach((c) => pickLargestImageInContainer(c, msg, items, seen));
+      for (const c of containers) {
+        const scope = scopes.find((s) => s.contains(c)) || normalizeMessageEl(msg);
+        pickBestMediaInContainer(c, scope, items, seen);
+      }
     }
+
     if (!items.length) {
-      msg.querySelectorAll("img.full-media, .media-inner img, .Photo img").forEach((img) =>
-        addImageItem(items, seen, img, msg)
-      );
+      for (const scope of scopes) {
+        scope.querySelectorAll("img.full-media, .media-inner img, .Photo img, canvas.thumbnail").forEach((node) => {
+          if (node instanceof HTMLImageElement) addImageItem(items, seen, node, scope);
+          else if (node instanceof HTMLCanvasElement) addCanvasItem(items, seen, node, scope);
+        });
+      }
     }
 
     const collapsed = collapseImageItems(items);
@@ -1341,10 +1558,15 @@
     return collapsed.slice(0, maxSlots);
   }
 
-  function waitForImageReady(img) {
+  function waitForImageReady(img, maxMs = 2000) {
     return new Promise((resolve, reject) => {
       if (!img) {
         resolve();
+        return;
+      }
+      if (img instanceof HTMLCanvasElement) {
+        if (img.width > 0 && img.height > 0) resolve();
+        else reject(new Error("invalid canvas size"));
         return;
       }
       if (img.complete && img.naturalWidth > 0) {
@@ -1353,7 +1575,7 @@
       }
       img.onload = () => resolve();
       img.onerror = () => reject(new Error("image load failed"));
-      setTimeout(() => resolve(), 1200);
+      setTimeout(() => resolve(), maxMs);
     });
   }
 
@@ -1369,7 +1591,13 @@
     return canvas.toDataURL("image/jpeg", 0.92);
   }
 
+  async function canvasElementToDataUrl(canvas) {
+    await waitForImageReady(canvas);
+    return canvas.toDataURL("image/jpeg", 0.92);
+  }
+
   async function fetchImageAsDataUrl(url, imgEl) {
+    if (!url && imgEl instanceof HTMLCanvasElement) return await canvasElementToDataUrl(imgEl);
     if (!url && imgEl) return await imgElementToDataUrl(imgEl);
     if (!url) throw new Error("no image url");
 
@@ -1418,9 +1646,10 @@
     const manual = !!opts.manual;
     const text = extractMessageText(msg);
     const links = extractMessageLinks(msg);
-    const imageItems = collectMessageImages(msg);
-    const hasMediaShell = messageHasMediaShell(msg);
-    const albumSlots = countAlbumSlots(msg);
+    const stickerOnly = isStickerMessage(msg);
+    const imageItems = stickerOnly ? [] : collectMessageImages(msg);
+    const hasMediaShell = stickerOnly ? false : messageHasMediaShell(msg);
+    const albumSlots = stickerOnly ? 1 : countAlbumSlots(msg);
 
     if (manual && !imageItems.length && !hasMediaShell) {
       return {
@@ -1444,25 +1673,18 @@
     const imageDataUrls = [];
 
     if (imageItems.length) {
-      const perImgMs = manual ? 1400 : 2800;
-      const totalMs = manual ? 1800 : 3500;
-      const fetched = await Promise.race([
-        Promise.all(
-          imageItems
-            .slice(0, albumSlots)
-            .map((item) =>
-              Promise.race([
-                fetchImageAsDataUrl(item.url, item.img).catch(() => null),
-                new Promise((r) => setTimeout(() => r(null), perImgMs)),
-              ])
-            )
-        ),
-        new Promise((resolve) => setTimeout(() => resolve([]), totalMs)),
-      ]);
-      if (Array.isArray(fetched)) {
-        for (const data of fetched) {
-          if (data) imageDataUrls.push(data);
-        }
+      const imgCount = Math.min(albumSlots, imageItems.length);
+      const perImgMs = manual ? 2800 : 5000;
+      const fetched = await Promise.all(
+        imageItems.slice(0, imgCount).map((item) =>
+          Promise.race([
+            fetchImageAsDataUrl(item.url, item.img).catch(() => null),
+            new Promise((r) => setTimeout(() => r(null), perImgMs)),
+          ])
+        )
+      );
+      for (const data of fetched) {
+        if (data) imageDataUrls.push(data);
       }
     }
 
@@ -1483,6 +1705,7 @@
       hasImages: dedupedData.length > 0 || rawUrls.length > 0,
       mediaShell: hasMediaShell,
       albumSlots,
+      isSticker: stickerOnly,
     };
   }
 
