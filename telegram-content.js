@@ -18,6 +18,8 @@
   let lastForwardUiText = "";
   let chatReadyForForward = false;
 
+  scheduleBarInjection();
+
   init().catch((err) => {
     console.error("[tg-to-fb] init failed", err);
     scheduleBarInjection();
@@ -32,7 +34,7 @@
     bindChatNavigation();
     await waitForTelegramShell(20000);
     scheduleBarInjection();
-    onChatChanged(true);
+    onChatChanged(true).catch((err) => console.error("[tg-to-fb] onChatChanged", err));
     let statusTick = 0;
     setInterval(() => {
       if (!isTelegramStuckLoading()) {
@@ -119,6 +121,27 @@
     return el.querySelector(".Message") || el.closest(".Message") || el;
   }
 
+  function getMessageListItem(el) {
+    const msg = normalizeMessageEl(el);
+    return msg.closest(".message-list-item") || msg;
+  }
+
+  function isFirstInGroup(msg) {
+    return (
+      msg.classList.contains("first-in-group") ||
+      msg.classList.contains("first-in-document") ||
+      !!msg.querySelector(".message-subheader .sender-title, .message-subheader .message-title")
+    );
+  }
+
+  function isGroupedContinuation(msg) {
+    return (
+      msg.classList.contains("middle-in-group") ||
+      msg.classList.contains("last-in-group") ||
+      (msg.classList.contains("grouped") && !isFirstInGroup(msg))
+    );
+  }
+
   /** TG Web A 使用 .Message；兼容 message-list-item */
   function findMessageNodes() {
     const root =
@@ -149,41 +172,94 @@
     return [...byId.values()];
   }
 
-  /** 同组连续消息：从前面几条消息的头像/昵称推断发送者 */
+  function extractSenderPeerKey(listItem) {
+    const av = findAvatarInListItem(listItem);
+    if (!av) return "";
+    const peer =
+      av.getAttribute("data-peer-id") ||
+      av.getAttribute("data-peer") ||
+      av.querySelector("[data-peer-id]")?.getAttribute("data-peer-id") ||
+      "";
+    if (peer) return `peer:${peer}`;
+    const img = av.querySelector("img");
+    if (img?.src && !img.src.startsWith("data:")) {
+      try {
+        const u = new URL(img.src, location.origin);
+        return `img:${u.pathname}`;
+      } catch {
+        return `img:${img.src.split("?")[0]}`;
+      }
+    }
+    const label = (img?.alt || av.getAttribute("aria-label") || av.title || "").trim();
+    if (label && label.length < 80) return `name:${label.toLowerCase()}`;
+    return "";
+  }
+
   function findSenderFromPreviousMessages(msg) {
-    let node = msg;
-    for (let i = 0; i < 12; i++) {
-      node = node?.previousElementSibling;
-      if (!node) break;
-      const prev = normalizeMessageEl(node);
-      if (isOwnMessage(prev)) break;
-      const s = extractSender(prev);
+    let item = getMessageListItem(msg);
+    for (let i = 0; i < 24; i++) {
+      item = item?.previousElementSibling;
+      if (!item) break;
+      const prevMsg = normalizeMessageEl(item.querySelector?.(".Message") || item);
+      if (isOwnMessage(prevMsg)) break;
+      const s = extractSender(prevMsg, item);
       if (s) return s;
     }
     return "";
   }
 
-  function resolveMessageSender(el, lastSender) {
-    let sender = extractSender(el);
-    if (sender) return sender;
-    if (lastSender) return lastSender;
-    return findSenderFromPreviousMessages(el);
+  function resolveMessageSender(el, ctx) {
+    const msg = normalizeMessageEl(el);
+    const listItem = getMessageListItem(msg);
+    const peerKey = extractSenderPeerKey(listItem);
+    const direct = extractSender(msg, listItem);
+
+    if (direct) {
+      if (peerKey && peerKey !== ctx.lastPeerKey) {
+        ctx.lastPeerKey = peerKey;
+      }
+      return direct;
+    }
+
+    if (peerKey && ctx.lastPeerKey && peerKey !== ctx.lastPeerKey) {
+      ctx.lastPeerKey = peerKey;
+      ctx.lastSender = "";
+    }
+
+    if (isFirstInGroup(msg)) {
+      const fromPrev = findSenderFromPreviousMessages(msg);
+      if (fromPrev) return fromPrev;
+      return "";
+    }
+
+    if (isGroupedContinuation(msg) && ctx.lastSender) {
+      if (!peerKey || !ctx.lastPeerKey || peerKey === ctx.lastPeerKey) {
+        return ctx.lastSender;
+      }
+    }
+
+    if (ctx.lastSender && (!peerKey || peerKey === ctx.lastPeerKey)) {
+      return ctx.lastSender;
+    }
+
+    return findSenderFromPreviousMessages(msg);
   }
 
   /** 按 DOM 顺序遍历，补全群聊里“不重复显示昵称”的发送者 */
   function walkMessagesWithSender() {
     const nodes = findMessageNodes();
-    let lastSender = "";
+    const ctx = { lastSender: "", lastPeerKey: "" };
     const result = [];
 
     for (const raw of nodes) {
       const el = normalizeMessageEl(raw);
       if (isOwnMessage(el)) {
-        lastSender = "";
+        ctx.lastSender = "";
+        ctx.lastPeerKey = "";
         continue;
       }
-      const sender = resolveMessageSender(el, lastSender);
-      if (sender) lastSender = sender;
+      const sender = resolveMessageSender(el, ctx);
+      if (sender) ctx.lastSender = sender;
       if (!sender) continue;
       result.push({ el, sender });
     }
@@ -191,9 +267,16 @@
   }
 
   function collectSenders() {
-    const names = new Set();
-    for (const { sender } of walkMessagesWithSender()) names.add(sender);
-    return [...names].sort((a, b) => a.localeCompare(b, "zh"));
+    try {
+      const names = new Set();
+      for (const { sender } of walkMessagesWithSender()) {
+        if (sender && sender !== "未知") names.add(sender);
+      }
+      return [...names].sort((a, b) => a.localeCompare(b, "zh"));
+    } catch (err) {
+      console.error("[tg-to-fb] collectSenders failed", err);
+      return [];
+    }
   }
 
   function getChatKey() {
@@ -283,9 +366,14 @@
   }
 
   function runInjectPass() {
-    injectMessageCheckboxes();
-    renderSenderPicker();
-    updateBarStatus();
+    try {
+      injectMessageCheckboxes();
+      renderSenderPicker();
+      updateBarStatus();
+    } catch (err) {
+      console.error("[tg-to-fb] runInjectPass failed", err);
+      scheduleBarInjection();
+    }
   }
 
   function scanExistingMessages() {
@@ -326,35 +414,49 @@
     return false;
   }
 
-  function extractSender(el) {
+  function isLikelySenderName(text) {
+    const t = (text || "").trim();
+    if (!t || t.length >= 80) return false;
+    if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(t)) return false;
+    if (/^(已发送|已送达|已读|发送中|edited|已编辑)$/i.test(t)) return false;
+    if (/^via @/i.test(t)) return false;
+    return true;
+  }
+
+  function extractSender(el, listItem) {
     const msg = normalizeMessageEl(el);
+    const scope = listItem || getMessageListItem(msg);
 
     const selectors = [
       ".message-subheader .sender-title",
       ".message-subheader .message-title",
+      ".message-subheader .peer-title",
       ".sender-title",
       ".message-title",
       ".peer-title",
       ".message-author",
+      ".user-title",
     ];
     for (const sel of selectors) {
-      const node = msg.querySelector(sel);
+      const node = msg.querySelector(sel) || scope.querySelector(sel);
       const t = node?.textContent?.trim();
-      if (t && t.length < 80 && !/^\d{1,2}:\d{2}$/.test(t)) return t;
+      if (isLikelySenderName(t)) return t;
     }
 
-    const avatar = findAvatarInMessage(msg);
+    const avatar = findAvatarInListItem(scope);
     if (avatar) {
       const img = avatar.querySelector("img");
-      if (img?.alt?.trim() && img.alt.length < 80) return img.alt.trim();
+      if (isLikelySenderName(img?.alt)) return img.alt.trim();
       const aria = avatar.getAttribute("aria-label") || avatar.title;
-      if (aria?.trim() && aria.length < 80) return aria.trim();
+      if (isLikelySenderName(aria)) return aria.trim();
     }
 
     const sub = msg.querySelector(".message-subheader");
     if (sub) {
-      const t = sub.textContent?.trim();
-      if (t && t.length < 80 && !/^\d{1,2}:\d{2}$/.test(t)) return t;
+      for (const node of sub.querySelectorAll("span, a, div")) {
+        const t = node.textContent?.trim();
+        if (isLikelySenderName(t)) return t;
+      }
     }
 
     return "";
@@ -374,7 +476,10 @@
     label.title = `勾选后自动转发「${sender}」`;
     label.append(cb, document.createTextNode(" 自动"));
 
-    cb.addEventListener("change", () => toggleSender(sender, cb.checked));
+    cb.addEventListener("change", (e) => {
+      e.stopPropagation();
+      toggleSender(sender, cb.checked);
+    });
 
     const btn = document.createElement("button");
     btn.type = "button";
@@ -386,25 +491,45 @@
     return wrap;
   }
 
-  /** 群聊头像可能在子节点；同组多条消息时头像常在 last-in-group */
+  /** 群聊头像可能在 message-list-item 内、与 .Message 并列 */
+  function findAvatarInListItem(scope) {
+    if (!(scope instanceof Element)) return null;
+    try {
+      const root = scope;
+      const msg = root.classList.contains("Message") ? root : root.querySelector(".Message");
+
+      for (const child of root.children) {
+        if (child.matches?.(".Avatar, .avatar") && isElementVisible(child)) return child;
+      }
+      if (msg) {
+        for (const child of msg.children) {
+          if (child.matches?.(".Avatar, .avatar") && isElementVisible(child)) return child;
+        }
+      }
+
+      const candidates = [...root.querySelectorAll(".Avatar, .avatar")].filter(
+        (node) => !node.closest(`.${CHECK_CLASS}`) && isElementVisible(node)
+      );
+      if (!candidates.length) return null;
+
+      const anchor = msg || root;
+      const msgRect = anchor.getBoundingClientRect();
+      candidates.sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        const aLeft = Math.abs(ar.left - msgRect.left);
+        const bLeft = Math.abs(br.left - msgRect.left);
+        return aLeft - bLeft || ar.top - br.top;
+      });
+      return candidates[0];
+    } catch (err) {
+      console.warn("[tg-to-fb] findAvatarInListItem", err);
+      return null;
+    }
+  }
+
   function findAvatarInMessage(msg) {
-    const direct = msg.querySelector(":scope > .Avatar, :scope > .avatar");
-    if (direct && isElementVisible(direct)) return direct;
-
-    const candidates = [...msg.querySelectorAll(".Avatar, .avatar")].filter(
-      (node) => !node.closest(`.${CHECK_CLASS}`) && isElementVisible(node)
-    );
-    if (!candidates.length) return null;
-
-    const msgRect = msg.getBoundingClientRect();
-    candidates.sort((a, b) => {
-      const ar = a.getBoundingClientRect();
-      const br = b.getBoundingClientRect();
-      const aLeft = Math.abs(ar.left - msgRect.left);
-      const bLeft = Math.abs(br.left - msgRect.left);
-      return aLeft - bLeft || ar.top - br.top;
-    });
-    return candidates[0];
+    return findAvatarInListItem(getMessageListItem(msg));
   }
 
   function isElementVisible(el) {
@@ -414,14 +539,29 @@
 
   function messageNeedsCheckbox(msg) {
     if (msg.querySelector(`.${CHECK_CLASS}`)) return false;
-    if (findAvatarInMessage(msg)) return true;
+    const listItem = getMessageListItem(msg);
+    if (findAvatarInListItem(listItem)) return true;
     return (
       msg.classList.contains("has-guest-avatar") ||
       msg.classList.contains("first-in-group") ||
       msg.classList.contains("last-in-group") ||
       msg.classList.contains("has-avatar") ||
+      isFirstInGroup(msg) ||
       msg.querySelector(".message-content-wrapper, .message-content")
     );
+  }
+
+  function syncExistingCheckboxSender(msg, sender) {
+    const wrap = msg.querySelector(`.${CHECK_CLASS}`);
+    if (!wrap || !sender || sender === "未知") return;
+    if (wrap.dataset.sender === sender) return;
+    wrap.dataset.sender = sender;
+    const cb = wrap.querySelector(".tgfb-cb");
+    if (cb) {
+      cb.dataset.sender = sender;
+      cb.checked = senderMatches(sender, getWatchList());
+      wrap.querySelector("label")?.setAttribute("title", `勾选后自动转发「${sender}」`);
+    }
   }
 
   function getMessageContentAnchor(msg) {
@@ -496,26 +636,32 @@
   function injectMessageCheckboxes() {
     let injected = 0;
     const nodes = findMessageNodes();
-    let lastSender = "";
+    const ctx = { lastSender: "", lastPeerKey: "" };
 
     for (const raw of nodes) {
       const msg = normalizeMessageEl(raw);
       if (isOwnMessage(msg)) {
-        lastSender = "";
+        ctx.lastSender = "";
+        ctx.lastPeerKey = "";
         continue;
       }
-      if (msg.querySelector(`.${CHECK_CLASS}`)) continue;
+
+      const sender = resolveMessageSender(msg, ctx) || "";
+      if (sender) ctx.lastSender = sender;
+
+      if (msg.querySelector(`.${CHECK_CLASS}`)) {
+        if (sender) syncExistingCheckboxSender(msg, sender);
+        continue;
+      }
       if (!messageNeedsCheckbox(msg)) continue;
 
-      const sender = resolveMessageSender(msg, lastSender) || lastSender || "未知";
-      if (sender && sender !== "未知") lastSender = sender;
-
-      const wrap = buildMessageActionsWrap(sender);
+      const label = sender || "未知";
+      const wrap = buildMessageActionsWrap(label);
       const btn = wrap.querySelector(".tgfb-forward-now");
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         e.preventDefault();
-        forwardMessageNow(msg, sender, btn);
+        forwardMessageNow(msg, label, btn);
       });
       if (placeCheckboxOnMessage(msg, wrap)) injected++;
     }
@@ -559,7 +705,10 @@
       cb.className = "tgfb-picker-cb";
       cb.dataset.sender = name;
       cb.checked = senderMatches(name, list);
-      cb.addEventListener("change", () => toggleSender(name, cb.checked));
+      cb.addEventListener("change", (e) => {
+        e.stopPropagation();
+        toggleSender(name, cb.checked);
+      });
       label.append(cb, document.createTextNode(` ${name}`));
       host.appendChild(label);
     }
@@ -574,14 +723,17 @@
   }
 
   async function toggleSender(sender, enabled) {
+    const name = (sender || "").trim();
+    if (!name || name === "未知") return;
     const list = new Set(getWatchList());
-    if (enabled) list.add(sender);
-    else list.delete(sender);
+    if (enabled) list.add(name);
+    else list.delete(name);
     const watchUserNames = [...list];
-    await saveConfig({ watchUserNames });
-    if (enabled) markSenderMessagesSeen(sender);
+    config = { ...config, watchUserNames };
     syncAllCheckboxes();
-    updateBarStatus(enabled ? `已监听：${sender}` : `已取消：${sender}`);
+    if (enabled) markSenderMessagesSeen(name);
+    updateBarStatus(enabled ? `已监听：${name}` : `已取消：${name}`);
+    await saveConfig({ watchUserNames });
   }
 
   function messageHasMediaShell(msg) {
@@ -718,12 +870,12 @@
 
   function senderMatches(sender, watchList) {
     const a = (sender || "").trim().toLowerCase();
-    if (!a || !watchList?.length) return false;
+    if (!a || a === "未知" || !watchList?.length) return false;
     return watchList.some((name) => {
       const b = String(name || "")
         .trim()
         .toLowerCase();
-      return b && (a === b || a.includes(b) || b.includes(a));
+      return b && a === b;
     });
   }
 
@@ -1114,6 +1266,8 @@
 
   function injectSettingsBar() {
     if (document.getElementById(BAR_ID)) return;
+    const mount = document.body || document.documentElement;
+    if (!mount) return;
 
     const bar = document.createElement("div");
     bar.id = BAR_ID;
@@ -1269,39 +1423,50 @@
       <div class="status tgfb-expand-only" id="tgfb-chat-id"></div>
     `;
 
-    document.body.appendChild(bar);
+    try {
+      mount.appendChild(bar);
+    } catch (err) {
+      console.error("[tg-to-fb] append bar failed", err);
+      return;
+    }
 
-    bar.querySelector("#tgfb-save").addEventListener("click", onSaveBar);
-    bar.querySelector("#tgfb-open-home").addEventListener("click", () => {
-      location.href = "https://web.telegram.org/a/";
-    });
-    bar.querySelector("#tgfb-refresh-senders").addEventListener("click", () => {
-      runInjectPass();
-      updateBarStatus(`已刷新，识别到 ${collectSenders().length} 位发言者`);
-    });
-    bar.querySelector("#tgfb-enabled").addEventListener("change", async (e) => {
-      config.enabled = e.target.checked;
-      if (config.enabled) {
-        chatReadyForForward = false;
-        await markAllVisibleMessagesSeen();
-        chatReadyForForward = true;
-      } else {
-        chatReadyForForward = false;
-      }
-      saveConfig({ enabled: config.enabled }).then(updateBarStatus);
-    });
-    bar.querySelector("#tgfb-bar-toggle").addEventListener("click", () => {
-      const mini = bar.classList.contains("tgfb-mini");
-      setBarExpanded(mini);
-    });
+    try {
+      bar.querySelector("#tgfb-save").addEventListener("click", onSaveBar);
+      bar.querySelector("#tgfb-open-home").addEventListener("click", () => {
+        location.href = "https://web.telegram.org/a/";
+      });
+      bar.querySelector("#tgfb-refresh-senders").addEventListener("click", () => {
+        runInjectPass();
+        updateBarStatus(`已刷新，识别到 ${collectSenders().length} 位发言者`);
+      });
+      bar.querySelector("#tgfb-enabled").addEventListener("change", async (e) => {
+        config.enabled = e.target.checked;
+        if (config.enabled) {
+          chatReadyForForward = false;
+          await markAllVisibleMessagesSeen();
+          chatReadyForForward = true;
+        } else {
+          chatReadyForForward = false;
+        }
+        saveConfig({ enabled: config.enabled }).then(updateBarStatus);
+      });
+      bar.querySelector("#tgfb-bar-toggle").addEventListener("click", () => {
+        const mini = bar.classList.contains("tgfb-mini");
+        setBarExpanded(mini);
+      });
 
-    bindBarDrag(bar);
-    bindBarResizeObserver(bar);
-    initBarCollapseState(bar);
-    loadBarPosition(bar);
-    syncSettingsBar();
-    renderSenderPicker();
-    updateBarStatus();
+      bindBarDrag(bar);
+      bindBarResizeObserver(bar);
+      initBarCollapseState(bar);
+      loadBarPosition(bar);
+      syncSettingsBar();
+      renderSenderPicker();
+      updateBarStatus();
+    } catch (err) {
+      console.error("[tg-to-fb] bar setup failed", err);
+    }
+    document.body.classList.add("tgfb-bar-active");
+    applyBarOffset();
   }
 
   function setBarExpanded(expanded) {
@@ -1321,7 +1486,7 @@
 
   function initBarCollapseState(bar) {
     chrome.storage.local.get([BAR_COLLAPSED_KEY], (data) => {
-      const collapsed = data[BAR_COLLAPSED_KEY] !== false;
+      const collapsed = data[BAR_COLLAPSED_KEY] === true;
       setBarExpanded(!collapsed);
     });
   }
@@ -1360,10 +1525,13 @@
   function loadBarPosition(bar) {
     chrome.storage.local.get([BAR_POSITION_KEY], (data) => {
       const pos = data[BAR_POSITION_KEY];
-      if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
-        applyBarPosition(bar, pos.left, pos.top);
-        applyBarOffset();
+      if (!pos || !Number.isFinite(pos.left) || !Number.isFinite(pos.top)) return;
+      if (pos.left < -2000 || pos.top < -2000 || pos.left > 8000 || pos.top > 8000) {
+        resetBarPosition(bar);
+        return;
       }
+      applyBarPosition(bar, pos.left, pos.top);
+      applyBarOffset();
     });
   }
 
@@ -1530,9 +1698,17 @@
 
   function scheduleBarInjection() {
     const tryInject = () => {
-      if (!document.getElementById(BAR_ID)) injectSettingsBar();
+      if (!document.body && !document.documentElement) return;
+      if (document.getElementById(BAR_ID)) return;
+      try {
+        injectSettingsBar();
+      } catch (err) {
+        console.error("[tg-to-fb] injectSettingsBar failed", err);
+      }
     };
-    setTimeout(tryInject, 500);
+    tryInject();
+    setTimeout(tryInject, 300);
+    setTimeout(tryInject, 1200);
     setInterval(tryInject, 3000);
   }
 
