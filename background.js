@@ -1,4 +1,4 @@
-importScripts("filter.js", "image-dedupe.js", "fb-api-send.js");
+importScripts("config.js", "filter.js", "image-dedupe.js", "fb-api-send.js");
 
 const DEFAULT_CONFIG = {
   enabled: false,
@@ -25,31 +25,29 @@ const QUEUE_KEY = "forwardQueue";
 const FORWARDED_IDS_KEY = "tgfbForwardedIds";
 const IMAGE_STASH_PREFIX = "tgfb_img_";
 const FORWARD_STATUS_KEY = "forwardStatus";
+const FORWARD_LOG_KEY = "forwardLog";
 const claimedMessageIds = new Set();
 const TG_MONITOR_TAB_KEY = "tgMonitorTabId";
-const FB_WORKER_TAB_KEY = "fbWorkerTabId";
-const FB_WORKER_URL = "https://www.facebook.com/messages/";
-const FB_WORKER_ALT_URL = "https://www.facebook.com/";
-const FB_TAB_QUERY_URLS = ["*://*.facebook.com/*", "*://facebook.com/*"];
 const FB_DELIVERY_LOCKS_KEY = "fbDeliveryLocks";
 const FB_DELIVERY_TTL_MS = 3 * 60 * 1000;
 const fbSendInFlight = new Set();
-const fbTabSendQueues = new Map();
 const TG_MONITOR_ALARM = "tgMonitor";
+const TG_WAKE_ALARM = "tgWake";
+const TG_WAKE_INTERVAL_MS = 12000;
 const TG_HOME_URL = "https://web.telegram.org/a/";
 let processing = false;
-const fbTabCache = new Map();
-const fbContentInjected = new Set();
 const MAX_QUEUE_FAILURES = 6;
 const MAX_FB_TARGETS = 10;
 const MAX_TARGET_FAILURES = 3;
-const INTER_GROUP_SEND_DELAY_MS = 450;
+/** 一键群发：每个 FB 群之间间隔（用户要求约 2 秒） */
+const INTER_GROUP_SEND_DELAY_MS = 2000;
+/** 自动排队转发：群与群之间短间隔（单条发送走快速路径） */
+const INTER_GROUP_AUTO_DELAY_MS = 400;
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.get(["config"], (data) => {
     if (!data.config) chrome.storage.local.set({ config: DEFAULT_CONFIG });
   });
-  chrome.storage.local.remove(FB_WORKER_TAB_KEY);
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -116,6 +114,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (type === "TG_REGISTER_TAB") {
+    const tabId = _sender?.tab?.id;
+    if (tabId) {
+      chrome.storage.local.set({ [TG_MONITOR_TAB_KEY]: tabId });
+      setTabUndiscardable(tabId).catch(() => {});
+    }
+    sendResponse({ ok: true, tabId });
+    return false;
+  }
+
+  if (type === "GET_FORWARD_LOG") {
+    getForwardLog()
+      .then((log) => sendResponse({ ok: true, log }))
+      .catch((error) => sendResponse({ ok: false, error: error.message || "读取日志失败" }));
+    return true;
+  }
+
   return false;
 });
 
@@ -123,18 +138,23 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "refreshSheets") refreshSheetsRules().catch(() => {});
   if (alarm.name === "processQueue") processQueue().catch(() => {});
   if (alarm.name === TG_MONITOR_ALARM) runBackgroundWatch().catch(() => {});
+  if (alarm.name === TG_WAKE_ALARM) {
+    getConfig()
+      .then(async (cfg) => {
+        if (!cfg?.enabled) return;
+        await keepWatchTabsAlive(cfg);
+        await processQueue();
+        scheduleTgWakeAlarm(cfg);
+      })
+      .catch(() => {});
+  }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  fbContentInjected.delete(tabId);
-  for (const [threadId, cachedId] of fbTabCache.entries()) {
-    if (cachedId === tabId) fbTabCache.delete(threadId);
-  }
-  chrome.storage.local.get([TG_MONITOR_TAB_KEY, FB_WORKER_TAB_KEY], (data) => {
-    const removeKeys = [];
-    if (data[TG_MONITOR_TAB_KEY] === tabId) removeKeys.push(TG_MONITOR_TAB_KEY);
-    if (data[FB_WORKER_TAB_KEY] === tabId) removeKeys.push(FB_WORKER_TAB_KEY);
-    if (removeKeys.length) chrome.storage.local.remove(removeKeys);
+  chrome.storage.local.get([TG_MONITOR_TAB_KEY], (data) => {
+    if (data[TG_MONITOR_TAB_KEY] === tabId) {
+      chrome.storage.local.remove(TG_MONITOR_TAB_KEY);
+    }
   });
 });
 
@@ -144,6 +164,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   scheduleSheetsAlarm(cfg);
   scheduleMonitorAlarm(cfg);
   scheduleQueueAlarm(cfg);
+  scheduleTgWakeAlarm(cfg);
   if (cfg?.enabled && cfg?.fbThreadUrls?.length) prewarmFacebookTabs(cfg).catch(() => {});
 });
 
@@ -340,6 +361,7 @@ async function saveConfig(partial) {
   scheduleSheetsAlarm(normalized);
   scheduleMonitorAlarm(normalized);
   scheduleQueueAlarm(normalized);
+  scheduleTgWakeAlarm(normalized);
   if (!normalized.enabled) {
     await stopForwardQueue(wasEnabled);
   } else if (normalized.fbThreadUrls?.length) {
@@ -373,6 +395,19 @@ async function setForwardStatus(text, level = "info") {
   });
 }
 
+async function getForwardLog() {
+  const data = await chrome.storage.local.get([FORWARD_LOG_KEY]);
+  return data[FORWARD_LOG_KEY] || [];
+}
+
+async function appendForwardLog(entry) {
+  const max = TgFbConfig?.MAX_FORWARD_LOG || 50;
+  const data = await chrome.storage.local.get([FORWARD_LOG_KEY]);
+  const log = data[FORWARD_LOG_KEY] || [];
+  log.unshift({ ...entry, time: Date.now() });
+  await chrome.storage.local.set({ [FORWARD_LOG_KEY]: log.slice(0, max) });
+}
+
 function isValidTelegramChatUrl(url) {
   if (!isTelegramChatUrl(url)) return false;
   const m = String(url).match(/#(.+)$/);
@@ -380,117 +415,6 @@ function isValidTelegramChatUrl(url) {
   const id = decodeURIComponent(m[1]).replace(/[^\d-@a-zA-Z_]/g, "");
   if (!id || /^-?0+$/.test(id)) return false;
   return true;
-}
-
-async function injectFacebookContent(tabId) {
-  try {
-    const res = await chrome.tabs.sendMessage(tabId, { type: "TGFB_PING" });
-    if (res?.ok) {
-      fbContentInjected.add(tabId);
-      return;
-    }
-  } catch {
-    /* script not ready */
-  }
-  if (fbContentInjected.has(tabId)) return;
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["facebook-content.js"],
-    });
-  } catch {
-    /* manifest content_scripts may already be present */
-  }
-  fbContentInjected.add(tabId);
-}
-
-function isFacebookTabUrl(url) {
-  return isInjectableFacebookUrl(url) && !String(url).includes("/login");
-}
-
-function isMessengerSendTabUrl(url) {
-  return (
-    isInjectableFacebookUrl(url) &&
-    !String(url).includes("/login") &&
-    /facebook\.com\/messages/i.test(url)
-  );
-}
-
-function isInjectableFacebookUrl(url) {
-  if (!url || /^(about:|chrome:|edge:|devtools:)/i.test(url)) return false;
-  if (/messenger\.com/i.test(url)) return false;
-  try {
-    const host = new URL(url).hostname.toLowerCase();
-    return host === "facebook.com" || host === "www.facebook.com" || host.endsWith(".facebook.com");
-  } catch {
-    return false;
-  }
-}
-
-async function getTabUrlSafe(tabId) {
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    return tab?.url || "";
-  } catch {
-    return "";
-  }
-}
-
-async function safeExecuteScript(details) {
-  try {
-    return await chrome.scripting.executeScript(details);
-  } catch (err) {
-    const msg = String(err?.message || err);
-    if (/cannot access contents|extension manifest must request permission/i.test(msg)) {
-      throw new Error("无法访问 Facebook 页面：请用 Chrome 打开 facebook.com 登录（勿用 messenger.com）");
-    }
-    throw err;
-  }
-}
-
-async function ensureInjectableFacebookTab(tabId) {
-  const tab = await chrome.tabs.get(tabId);
-  if (!tab?.id) throw new Error("FB 标签无效");
-  if (isInjectableFacebookUrl(tab.url)) return tab.id;
-
-  await chrome.tabs.update(tab.id, { url: FB_WORKER_URL, active: false });
-  await waitForTabComplete(tab.id, 22000);
-  const url = await getTabUrlSafe(tab.id);
-  if (!isInjectableFacebookUrl(url)) {
-    throw new Error("Facebook 页面无法加载，请手动打开 facebook.com 并保持登录");
-  }
-  return tab.id;
-}
-
-async function prepareTabForMessengerSend(tabId) {
-  return ensureInjectableFacebookTab(tabId);
-}
-
-async function findExistingFbThreadTab(threadId) {
-  if (!threadId) return null;
-  const tabs = await chrome.tabs.query({ url: FB_TAB_QUERY_URLS });
-  return (
-    tabs.find(
-      (t) =>
-        t.id &&
-        t.url &&
-        (t.url.includes(`/messages/t/${threadId}`) || t.url.includes(`/t/${threadId}`))
-    ) || null
-  );
-}
-
-async function findAnyFacebookTab() {
-  const tabs = await chrome.tabs.query({ url: FB_TAB_QUERY_URLS });
-  const sorted = tabs
-    .filter((t) => isFacebookTabUrl(t.url))
-    .sort((a, b) => {
-      const score = (t) =>
-        (isMessengerSendTabUrl(t.url) ? 4 : 0) +
-        (t.url?.includes("facebook.com/messages") ? 2 : 0) +
-        (t.active ? 1 : 0);
-      return score(b) - score(a);
-    });
-  return sorted[0] || null;
 }
 
 async function hasFacebookLoginCookie() {
@@ -506,178 +430,26 @@ async function hasFacebookLoginCookie() {
   return false;
 }
 
-async function probePageDtsg(tabId) {
-  const url = await getTabUrlSafe(tabId);
-  if (!isInjectableFacebookUrl(url)) return { dtsg: false, href: url };
-
-  try {
-    const [{ result }] = await safeExecuteScript({
-    target: { tabId },
-    world: "MAIN",
-    func: () => {
-      function pick(html) {
-        const patterns = [
-          /"DTSGInitialData",\[\],\{"token":"([^"]+)"/,
-          /"DTSGInitData",\[\],\{"token":"([^"]+)"/,
-          /"dtsg":\{"token":"([^"]+)"/,
-          /name="fb_dtsg"\s+value="([^"]+)"/,
-        ];
-        for (const re of patterns) {
-          const m = html.match(re);
-          if (m?.[1]) return m[1];
-        }
-        return "";
-      }
-      let dtsg = pick(document.documentElement.innerHTML);
-      if (!dtsg) {
-        try {
-          if (typeof require === "function") {
-            const mod = require("DTSGInitData") || require("DTSG");
-            if (mod?.token) dtsg = mod.token;
-          }
-        } catch {
-          /* ignore */
-        }
-      }
-      return { dtsg: !!dtsg, href: location.href };
-    },
-    });
-    return result || { dtsg: false };
-  } catch {
-    return { dtsg: false, href: url };
-  }
-}
-
-async function waitForPageDtsg(tabId, maxMs = 14000) {
-  const start = Date.now();
-  while (Date.now() - start < maxMs) {
-    const probe = await probePageDtsg(tabId);
-    if (probe.dtsg) return true;
-    await sleep(500);
-  }
-  return false;
-}
-
-async function openWorkerTab(url) {
-  const tab = await chrome.tabs.create({ url, active: false });
-  await setTabUndiscardable(tab.id);
-  await waitForTabComplete(tab.id, 22000);
-  await sleep(1000);
-  await chrome.storage.local.set({ [FB_WORKER_TAB_KEY]: tab.id });
-  return tab.id;
-}
-
-async function ensureFacebookWorkerTab() {
+async function sendJobViaBackgroundApi(job, target) {
   const loggedIn = await hasFacebookLoginCookie();
   if (!loggedIn) {
-    throw new Error("Chrome 未检测到 FB 登录 Cookie：请用同一浏览器打开 facebook.com 登录一次");
+    throw new Error("Chrome 未检测到 FB 登录：请在任意标签页登录 facebook.com，无需保持页面打开");
   }
-
-  const stored = await chrome.storage.local.get([FB_WORKER_TAB_KEY]);
-  const cachedId = stored[FB_WORKER_TAB_KEY];
-  if (cachedId) {
-    try {
-      const tab = await chrome.tabs.get(cachedId);
-      if (tab?.id) {
-        if (!isInjectableFacebookUrl(tab.url)) {
-          await chrome.storage.local.remove(FB_WORKER_TAB_KEY);
-          try {
-            await chrome.tabs.update(tab.id, { url: FB_WORKER_URL, active: false });
-            await waitForTabComplete(tab.id, 22000);
-            if (await waitForPageDtsg(tab.id, 12000)) {
-              await chrome.storage.local.set({ [FB_WORKER_TAB_KEY]: tab.id });
-              return tab.id;
-            }
-          } catch {
-            /* fall through */
-          }
-        } else if (isFacebookTabUrl(tab.url)) {
-          await setTabUndiscardable(tab.id);
-          if (await waitForPageDtsg(tab.id, 6000)) return tab.id;
-          await chrome.tabs.reload(tab.id);
-          await waitForTabComplete(tab.id, 20000);
-          if (await waitForPageDtsg(tab.id, 12000)) return tab.id;
-        }
-      }
-    } catch {
-      await chrome.storage.local.remove(FB_WORKER_TAB_KEY);
-    }
-  }
-
-  const existing = await findAnyFacebookTab();
-  if (existing?.id) {
-    await setTabUndiscardable(existing.id);
-    await chrome.storage.local.set({ [FB_WORKER_TAB_KEY]: existing.id });
-    if (await waitForPageDtsg(existing.id, 8000)) return existing.id;
-    await chrome.tabs.reload(existing.id);
-    await waitForTabComplete(existing.id, 20000);
-    if (await waitForPageDtsg(existing.id, 12000)) return existing.id;
-  }
-
-  let tabId = await openWorkerTab(FB_WORKER_URL);
-  if (await waitForPageDtsg(tabId, 12000)) return tabId;
-
-  tabId = await openWorkerTab(FB_WORKER_ALT_URL);
-  if (await waitForPageDtsg(tabId, 12000)) return tabId;
-
-  throw new Error("已登录 FB，但会话未就绪：请手动打开 facebook.com/messages 按 F5 刷新后再试");
-}
-
-async function sendViaPageContext(tabId, threadId, job) {
-  tabId = await prepareTabForMessengerSend(tabId);
-  if (!(await waitForPageDtsg(tabId, 8000))) {
-    await chrome.tabs.reload(tabId);
-    await waitForTabComplete(tabId, 18000);
-    if (!(await waitForPageDtsg(tabId, 10000))) {
-      throw new Error("FB 页面会话未就绪，请打开 facebook.com/messages 刷新后重试");
-    }
-  }
-
-  const results = await safeExecuteScript({
-    target: { tabId },
-    world: "MAIN",
-    func: TgFbApiSend.pageContextSendMessenger,
-    args: [threadId, job.text || "", (job.imageDataUrls || []).slice(0, 3)],
-  });
-  const result = results?.[0]?.result;
-  if (result === undefined || result === null) {
-    throw new Error("页面脚本无响应，将改用后台 API");
-  }
-  if (!result?.ok) throw new Error(result?.error || "页面内发送失败");
-  return result;
+  const res = await TgFbApiSend.sendMessengerJob(String(target.threadId), job);
+  return { ok: true, mode: res?.mode || "background-api" };
 }
 
 async function prewarmFacebookTabs(config) {
-  const targets = getFbTargets(config);
-  if (!targets.length) return;
+  if (!getFbTargets(config).length) return;
   try {
     const loggedIn = await hasFacebookLoginCookie();
     if (!loggedIn) {
-      await setForwardStatus("未检测到 FB 登录：请用 Chrome 打开 facebook.com 登录", "err");
+      await setForwardStatus("未检测到 FB 登录：请在任意 Chrome 标签页登录 facebook.com", "err");
       return;
     }
-    let ready = 0;
-    await Promise.all(
-      targets.map(async (target) => {
-        const tab = await findExistingFbThreadTab(target.threadId);
-        if (tab?.id && tab.url?.includes(`/messages/t/${target.threadId}`)) {
-          ready++;
-          await injectFacebookContent(tab.id);
-        }
-      })
-    );
-    if (ready === targets.length) {
-      await setForwardStatus(`已检测到 ${ready} 个 FB 群聊页，可以转发`, "ok");
-    } else if (ready > 0) {
-      await setForwardStatus(
-        `已检测到 ${ready}/${targets.length} 个群页，请手动打开其余 FB 群聊页`,
-        "info"
-      );
-    } else {
-      await setForwardStatus("请手动打开 FB 群聊页（messages/t/数字）后再转发", "info");
-    }
+    await setForwardStatus("Facebook 已登录，后台静默群发已就绪（无需打开群聊页）", "ok");
   } catch (err) {
-    await setForwardStatus(err.message || "FB 群页检查失败", "err");
+    await setForwardStatus(err.message || "FB 登录检查失败", "err");
   }
 }
 
@@ -708,70 +480,24 @@ function buildDeliveryLockKey(job, threadId) {
   return `${job.messageId}::${threadId}::${text}::img${img}`;
 }
 
-function fbThreadOpenHint(threadId) {
-  return `https://www.facebook.com/messages/t/${threadId}`;
-}
-
-async function ensureFbThreadTab(threadId, manual = false) {
-  const tid = String(threadId || "").trim();
-  if (!tid) throw new Error("无效的 FB 群 ID");
-
-  const existing = await findExistingFbThreadTab(tid);
-  if (!existing?.id) {
-    throw new Error(`请手动打开 FB 群聊页：${fbThreadOpenHint(tid)}`);
-  }
-  if (!existing.url?.includes(`/messages/t/${tid}`)) {
-    throw new Error(`当前 FB 标签不是该群，请打开：${fbThreadOpenHint(tid)}`);
-  }
-
-  await setTabUndiscardable(existing.id);
-  let coldStart = false;
-  if (existing.status !== "complete") {
-    await waitForTabComplete(existing.id, manual ? 6000 : 28000);
-    if (!manual) await sleep(600);
-    coldStart = !manual;
-  }
-  try {
-    await injectFacebookContent(existing.id);
-  } catch {
-    if (!manual) throw new Error("无法注入 FB 页面脚本，请刷新群聊页后重试");
-  }
-  return { tabId: existing.id, coldStart };
-}
-
 async function forwardManualJob(job) {
   const targets = job.fbTargets || [];
   if (!targets.length) throw new Error("未配置 FB 群");
 
-  const hasImages = (job.imageDataUrls?.length || 0) > 0;
-  setForwardStatus(`手动转发到 ${targets.length} 个群…`, "info");
-
-  const prepared = await Promise.all(
-    targets.map(async (target) => {
-      const { tabId } = await ensureFbThreadTab(target.threadId, true);
-      if (hasImages) await clearFbSentFlag(tabId, job.messageId);
-      return { target, tabId };
-    })
-  );
-
-  const results = await Promise.allSettled(
-    prepared.map(({ target, tabId }) =>
-      sendJobToFacebook(
-        {
-          ...job,
-          preparedTabId: tabId,
-          skipPreSentCheck: !hasImages,
-        },
-        target
-      )
-    )
-  );
+  setForwardStatus(`手动转发到 ${targets.length} 个群（每群间隔 ${INTER_GROUP_SEND_DELAY_MS / 1000}s）…`, "info");
 
   let ok = 0;
   const errors = [];
-  for (const r of results) {
-    if (r.status === "fulfilled" && r.value?.ok) ok++;
-    else errors.push(r.status === "rejected" ? r.reason?.message : r.value?.error || "发送失败");
+  for (let i = 0; i < targets.length; i++) {
+    const target = targets[i];
+    if (i > 0) await sleep(INTER_GROUP_SEND_DELAY_MS);
+    try {
+      const res = await sendJobToFacebook({ ...job, manual: true }, target);
+      if (res?.ok) ok++;
+      else errors.push(res?.error || "发送失败");
+    } catch (err) {
+      errors.push(err?.message || "发送失败");
+    }
   }
 
   if (!ok) throw new Error(errors[0] || "手动转发失败");
@@ -795,23 +521,36 @@ async function sendJobToFacebook(job, target) {
   fbSendInFlight.add(lockKey);
 
   try {
-    let tabId = job.preparedTabId;
-    let coldStart = false;
-    if (!tabId) {
-      const prep = await ensureFbThreadTab(target.threadId, job.manual);
-      tabId = prep.tabId;
-      coldStart = prep.coldStart;
-      if (job.manual && !job.skipPreSentCheck) await clearFbSentFlag(tabId, job.messageId);
-    }
-    const res = await sendToFacebookTab(tabId, {
-      ...job,
-      coldStart: job.manual ? false : coldStart,
+    const apiRes = await sendJobViaBackgroundApi(job, target);
+    if (!apiRes?.ok) throw new Error("Facebook API 发送失败");
+    if (!job.manual) await markDelivered(lockKey);
+    await appendForwardLog({
+      messageId: job.messageId,
+      threadId: target.threadId,
+      ok: true,
+      mode: apiRes.mode,
+      text: truncate(job.text, 60),
+      manual: !!job.manual,
     });
-    if (res?.ok) {
-      if (!job.manual) await markDelivered(lockKey);
-      return { ...res, mode: "composer-tab" };
+    return apiRes;
+  } catch (err) {
+    const errText = err?.message || "发送失败";
+    const msg = String(errText);
+    if (/登录|dtsg|cookie|checkpoint/i.test(msg)) {
+      TgFbApiSend.invalidateSession?.();
     }
-    throw new Error(res?.error || "群聊页发送失败");
+    await appendForwardLog({
+      messageId: job.messageId,
+      threadId: target.threadId,
+      ok: false,
+      error: errText,
+      text: truncate(job.text, 60),
+      manual: !!job.manual,
+    });
+    if (/checkpoint|登录|cookie|dtsg/i.test(errText)) {
+      notify(`Facebook 会话异常：${truncate(errText, 80)}`, true);
+    }
+    throw err;
   } finally {
     fbSendInFlight.delete(lockKey);
   }
@@ -1081,23 +820,6 @@ async function releaseForwardClaim(messageId) {
   await chrome.storage.local.set({ [FORWARDED_IDS_KEY]: map });
 }
 
-async function clearFbSentFlag(tabId, messageId) {
-  if (!tabId || !messageId) return;
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (mid) => {
-        const m = location.pathname.match(/\/messages\/t\/(\d+)/i);
-        const tid = m?.[1] || "";
-        sessionStorage.removeItem(tid ? `tgfb_sent_${tid}_${mid}` : `tgfb_sent_${mid}`);
-      },
-      args: [String(messageId)],
-    });
-  } catch {
-    /* ignore */
-  }
-}
-
 async function handleNewTelegramMessage(payload) {
   const config = await getConfig();
   const manual = !!payload.manual;
@@ -1147,9 +869,9 @@ async function handleNewTelegramMessage(payload) {
     id: `${payload.messageId}-${Date.now()}`,
     messageId: payload.messageId,
     text,
-    imageUrls: [],
+    imageUrls: payload.imageUrls || [],
     imageDataUrls,
-    imageStashKey: payload.imageStashKey || null,
+    imageStashKey: null,
     albumSlots,
     links: payload.links || [],
     sender: payload.sender,
@@ -1163,6 +885,7 @@ async function handleNewTelegramMessage(payload) {
     retryAt: 0,
     manual,
     textOnly: textOnlyManual || (!hasImages && !!text),
+    state: "pending",
   };
 
   if (manual) {
@@ -1232,12 +955,23 @@ function buildForwardText(payload) {
 
 async function resolveJobImages(payload, albumSlots, manual = false) {
   if (payload.isSticker) return [];
-  let imageDataUrls = await resolvePayloadImages(payload);
   const urlFallback = TgFbImageDedupe.dedupeImageRefs(payload.imageUrls || [], 5);
   const slotCount = Math.min(5, Math.max(1, Number(albumSlots) || 1));
-  const fetchTimeout = manual ? Math.min(15000, 2000 + slotCount * 2000) : Math.min(22000, 4000 + slotCount * 3500);
+  const cfg = TgFbConfig || {};
+  const fetchTimeout = manual
+    ? Math.min(
+        15000,
+        (cfg.MANUAL_IMAGE_FETCH_TIMEOUT_BASE_MS || 2000) +
+          slotCount * (cfg.MANUAL_IMAGE_FETCH_TIMEOUT_PER_SLOT_MS || 2000)
+      )
+    : Math.min(
+        22000,
+        (cfg.IMAGE_FETCH_TIMEOUT_BASE_MS || 4000) +
+          slotCount * (cfg.IMAGE_FETCH_TIMEOUT_PER_SLOT_MS || 3500)
+      );
 
-  if (!imageDataUrls.length && urlFallback.length) {
+  let imageDataUrls = [];
+  if (urlFallback.length) {
     imageDataUrls = await Promise.race([
       fetchImagesInTelegramTab(urlFallback),
       sleep(fetchTimeout).then(() => []),
@@ -1326,7 +1060,9 @@ async function processQueue() {
       return;
     }
 
-    await setForwardStatus(`正在向 FB 群 ${target.threadId} 发送（群聊页）…`, "info");
+    await setForwardStatus(`正在向 FB 群 ${target.threadId} 发送（API）…`, "info");
+    job.state = "sending";
+    await chrome.storage.local.set({ [QUEUE_KEY]: queue });
     const response = await sendJobToFacebook(job, target);
 
     if (response?.ok) {
@@ -1342,7 +1078,7 @@ async function processQueue() {
 
       if (isJobComplete(job)) {
         job.done = true;
-        await clearImageStash(job.imageStashKey);
+        job.state = "completed";
         const failCount = (job.failedTargetIds || []).length;
         notify(
           failCount
@@ -1362,7 +1098,7 @@ async function processQueue() {
           "info"
         );
         processing = false;
-        await sleep(INTER_GROUP_SEND_DELAY_MS);
+        await sleep(INTER_GROUP_AUTO_DELAY_MS);
         await processQueue();
         return;
       }
@@ -1391,7 +1127,7 @@ async function processQueue() {
           j.retryAt = 0;
           if (isJobComplete(j)) {
             j.done = true;
-            await clearImageStash(j.imageStashKey);
+            j.state = "completed";
             await setForwardStatus(
               `完成：成功 ${progress.done} 个，跳过 ${progress.failed} 个（共 ${progress.total} 个群）`,
               progress.failed ? "info" : "ok"
@@ -1418,7 +1154,7 @@ async function processQueue() {
     }
     if (skipToNextTarget) {
       processing = false;
-      await sleep(INTER_GROUP_SEND_DELAY_MS);
+      await sleep(INTER_GROUP_AUTO_DELAY_MS);
       await processQueue();
       return;
     }
@@ -1435,94 +1171,6 @@ async function processQueue() {
       setTimeout(() => processQueue().catch(() => {}), delay);
     }
   }
-}
-
-async function isFbManualJobAlreadySent(tabId, jobId) {
-  if (!tabId || !jobId) return false;
-  try {
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (jid) => {
-        const m = location.pathname.match(/\/messages\/t\/(\d+)/i);
-        const tid = m?.[1] || "";
-        const guard = tid ? `${tid}::${jid}` : String(jid);
-        return !!sessionStorage.getItem(`tgfb_manual_done_${guard}`);
-      },
-      args: [String(jobId)],
-    });
-    return !!result;
-  } catch {
-    return false;
-  }
-}
-
-async function isFbMessageAlreadySent(tabId, messageId) {
-  if (!tabId || !messageId) return false;
-  try {
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (mid) => {
-        const m = location.pathname.match(/\/messages\/t\/(\d+)/i);
-        const tid = m?.[1] || "";
-        const key = tid ? `tgfb_sent_${tid}_${mid}` : `tgfb_sent_${mid}`;
-        return !!sessionStorage.getItem(key);
-      },
-      args: [String(messageId)],
-    });
-    return !!result;
-  } catch {
-    return false;
-  }
-}
-
-function runInFbTabQueue(tabId, fn) {
-  const key = String(tabId);
-  const prev = fbTabSendQueues.get(key) || Promise.resolve();
-  const run = prev.catch(() => {}).then(() => fn());
-  fbTabSendQueues.set(
-    key,
-    run.catch(() => {})
-  );
-  return run;
-}
-
-async function sendToFacebookTabImpl(tabId, job) {
-  if (!job.skipPreSentCheck && (await isFbMessageAlreadySent(tabId, job.messageId))) {
-    return { ok: true, alreadySent: true };
-  }
-
-  let lastErr = null;
-  try {
-    const res = await chrome.tabs.sendMessage(tabId, { type: "FORWARD_TO_FB", job });
-    if (res?.ok) return res;
-    lastErr = new Error(res?.error || "Facebook 页面发送失败");
-  } catch (e) {
-    lastErr = e;
-    try {
-      await injectFacebookContent(tabId);
-      await sleep(job.manual ? 80 : 400);
-      if (await isFbMessageAlreadySent(tabId, job.messageId)) {
-        return { ok: true, alreadySent: true };
-      }
-      if (job.manual && (await isFbManualJobAlreadySent(tabId, job.id))) {
-        return { ok: true, alreadySent: true };
-      }
-      const res = await chrome.tabs.sendMessage(tabId, { type: "FORWARD_TO_FB", job });
-      if (res?.ok) return res;
-      lastErr = new Error(res?.error || "Facebook 页面发送失败");
-    } catch (e2) {
-      lastErr = e2;
-    }
-  }
-
-  if (!job.skipPreSentCheck && (await isFbMessageAlreadySent(tabId, job.messageId))) {
-    return { ok: true, alreadySent: true };
-  }
-  throw lastErr || new Error("无法连接 Facebook 标签页");
-}
-
-async function sendToFacebookTab(tabId, job) {
-  return runInFbTabQueue(tabId, () => sendToFacebookTabImpl(tabId, job));
 }
 
 function sleep(ms) {
@@ -1563,12 +1211,83 @@ function scheduleQueueAlarm(config) {
   chrome.alarms.create("processQueue", { periodInMinutes: 0.5 });
 }
 
+function scheduleTgWakeAlarm(config) {
+  chrome.alarms.clear(TG_WAKE_ALARM);
+  if (!config?.enabled) return;
+  chrome.alarms.create(TG_WAKE_ALARM, { when: Date.now() + TG_WAKE_INTERVAL_MS });
+}
+
+async function resolveTelegramMonitorTab(config) {
+  const stored = await chrome.storage.local.get([TG_MONITOR_TAB_KEY]);
+  const cachedId = stored[TG_MONITOR_TAB_KEY];
+  if (cachedId) {
+    try {
+      const tab = await chrome.tabs.get(cachedId);
+      if (tab?.id && /web\.telegram\.org/i.test(tab.url || "")) return tab.id;
+    } catch {
+      await chrome.storage.local.remove(TG_MONITOR_TAB_KEY);
+    }
+  }
+
+  const tabs = await chrome.tabs.query({ url: ["*://web.telegram.org/*"] });
+  if (!tabs.length) return null;
+
+  const wantUrl = config?.telegramChatUrl || "";
+  let hash = "";
+  try {
+    if (wantUrl) hash = new URL(wantUrl).hash || "";
+  } catch {
+    /* ignore */
+  }
+
+  const match =
+    (hash && tabs.find((t) => t.url && t.url.includes(hash))) ||
+    tabs.find((t) => /\/a\//i.test(t.url || "")) ||
+    tabs[0];
+
+  if (match?.id) {
+    await chrome.storage.local.set({ [TG_MONITOR_TAB_KEY]: match.id });
+    return match.id;
+  }
+  return null;
+}
+
+async function wakeTelegramMonitor(config) {
+  const cfg = config || (await getConfig());
+  const tabId = await resolveTelegramMonitorTab(cfg);
+  if (!tabId) return false;
+  await setTabUndiscardable(tabId);
+  try {
+    const res = await chrome.tabs.sendMessage(tabId, { type: "TG_WAKE_SCAN" });
+    if (res?.ok) return true;
+  } catch {
+    /* content script may be frozen; fall through */
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        window.dispatchEvent(new CustomEvent("tgfb-wake-scan"));
+      },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function keepWatchTabsAlive(config) {
+  const cfg = config || (await getConfig());
+  if (!cfg?.enabled) return;
+  await wakeTelegramMonitor(cfg);
+}
+
 async function runBackgroundWatch() {
   const config = await getConfig();
   if (!config.enabled) return;
-  if (config.fbThreadUrls?.length) {
-    prewarmFacebookTabs(config).catch(() => {});
-  }
+  scheduleTgWakeAlarm(config);
+  await keepWatchTabsAlive(config);
+  await prewarmFacebookTabs(config).catch(() => {});
   await processQueue();
 }
 
@@ -1671,6 +1390,7 @@ getConfig().then((cfg) => {
   scheduleSheetsAlarm(cfg);
   scheduleMonitorAlarm(cfg);
   scheduleQueueAlarm(cfg);
+  scheduleTgWakeAlarm(cfg);
   if (cfg.enabled) runBackgroundWatch().catch(() => {});
   if (cfg.sheetsUrl) refreshSheetsRules().catch(() => {});
 });

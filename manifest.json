@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Telegram → Facebook 群消息转发",
-  "version": "1.9.19",
-  "description": "在 Telegram 标签页配置 FB 群，手动打开群聊页后转发消息",
+  "version": "2.0.2",
+  "description": "Telegram 群消息静默转发到 Facebook Messenger；纯后台 API，无需打开群聊页",
   "permissions": ["storage", "tabs", "alarms", "notifications", "scripting", "cookies"],
   "host_permissions": [
     "https://web.telegram.org/*",
@@ -23,16 +23,7 @@
       "matches": [
         "https://web.telegram.org/*"
       ],
-      "js": ["image-dedupe.js", "telegram-content.js"],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": [
-        "https://www.facebook.com/*",
-        "https://facebook.com/*",
-        "https://m.facebook.com/*"
-      ],
-      "js": ["facebook-content.js"],
+      "js": ["image-dedupe.js", "telegram-react-bridge.js", "telegram-content.js"],
       "run_at": "document_idle"
     }
   ],

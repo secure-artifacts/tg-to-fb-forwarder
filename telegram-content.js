@@ -80,8 +80,29 @@
         });
         return true;
       }
+      if (msg?.type === "TG_WAKE_SCAN") {
+        try {
+          ensureObserver();
+          runInjectPass();
+          scanNewMessages();
+          sendResponse({ ok: true });
+        } catch (err) {
+          sendResponse({ ok: false, error: err?.message });
+        }
+        return true;
+      }
       return false;
     });
+
+    window.addEventListener("tgfb-wake-scan", () => {
+      ensureObserver();
+      runInjectPass();
+      scanNewMessages();
+    });
+
+    if (chrome?.runtime?.id) {
+      chrome.runtime.sendMessage({ type: "TG_REGISTER_TAB" }, () => void chrome.runtime.lastError);
+    }
   }
 
   function loadConfig() {
@@ -312,6 +333,10 @@
   }
 
   function extractStablePeerKey(listItem) {
+    const msg = normalizeMessageEl(listItem);
+    const reactPeer = globalThis.TgReactBridge?.getMessageMeta?.(msg)?.peerId;
+    if (reactPeer) return `peer:${reactPeer}`;
+
     const av = findAvatarInListItem(listItem);
     if (!av) return "";
     const peer =
@@ -619,15 +644,20 @@
   }
 
   function getMessageId(el) {
-    return (
-      el.getAttribute("data-message-id") ||
-      el.querySelector("[data-message-id]")?.getAttribute("data-message-id") ||
-      ""
-    );
+    const msg = normalizeMessageEl(el);
+    const domId =
+      msg.getAttribute("data-message-id") ||
+      msg.querySelector("[data-message-id]")?.getAttribute("data-message-id") ||
+      "";
+    if (domId) return domId;
+    const reactId = globalThis.TgReactBridge?.getMessageMeta?.(msg)?.messageId;
+    return reactId ? String(reactId) : "";
   }
 
   function isOwnMessage(el) {
     const msg = normalizeMessageEl(el);
+    const reactMeta = globalThis.TgReactBridge?.getMessageMeta?.(msg);
+    if (reactMeta?.isOutgoing === true) return true;
     if (msg.classList.contains("own")) return true;
     if (msg.classList.contains("message-out") || msg.classList.contains("is-out")) return true;
     if (msg.getAttribute("data-is-out") === "true") return true;
@@ -669,6 +699,9 @@
   function extractSender(el, listItem) {
     const msg = normalizeMessageEl(el);
     const scope = listItem || getMessageListItem(msg);
+
+    const reactSender = normalizeSenderName(globalThis.TgReactBridge?.getSenderName?.(msg) || "");
+    if (reactSender && isLikelySenderName(reactSender)) return reactSender;
 
     const fromTitle = extractSenderFromVisibleTitle(msg);
     if (fromTitle) return fromTitle;
@@ -1303,28 +1336,79 @@
     return String(text || "").trim();
   }
 
+  function extractLinePreservingText(root) {
+    if (!root) return "";
+    const out = [];
+
+    function appendNewline() {
+      if (out.length && out[out.length - 1] !== "\n") out.push("\n");
+    }
+
+    function walk(node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const t = (node.textContent || "").replace(/\u200b/g, "");
+        if (t) out.push(t);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const el = node;
+      if (typeof el.matches === "function" && el.matches(META_REMOVE_SELECTOR)) return;
+      if (el.closest?.(META_REMOVE_SELECTOR)) return;
+
+      const tag = el.tagName?.toLowerCase();
+      if (tag === "br") {
+        appendNewline();
+        return;
+      }
+
+      const beforeLen = out.length;
+      for (const child of el.childNodes) walk(child);
+
+      if (["p", "div", "li", "blockquote", "pre"].includes(tag) && out.length > beforeLen) {
+        appendNewline();
+      }
+    }
+
+    walk(root);
+    return out.join("").replace(/\r\n/g, "\n");
+  }
+
+  function readPlainTextFromElement(el) {
+    if (!(el instanceof HTMLElement)) return (el?.textContent || "").replace(/\u200b/g, "");
+    let text = (el.innerText || el.textContent || "").replace(/\u200b/g, "").replace(/\r\n/g, "\n");
+    if (!/\n/.test(text) && el.querySelector("br, p, div, blockquote, li, pre")) {
+      text = extractLinePreservingText(el);
+    }
+    return text;
+  }
+
   function sanitizeMessageText(raw) {
     if (!raw) return "";
-    let text = raw.replace(/\u200b/g, "").trim();
-    text = text.replace(/\s+\d{1,2}:\d{2,4}(?=\s|$)/g, " ").trim();
+    let text = String(raw).replace(/\u200b/g, "").replace(/\r\n/g, "\n");
+    text = text
+      .split("\n")
+      .map((line) => line.replace(/\s+\d{1,2}:\d{2,4}$/, ""))
+      .join("\n")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n[ \t]+/g, "\n")
+      .trim();
 
-    const lines = text.split(/\n/).map((l) => l.trim()).filter(Boolean);
-    const content = lines.filter((line) => !isTimestampOnlyLine(line));
+    const lines = text.split("\n");
+    const content = lines.filter((line) => line === "" || !isTimestampOnlyLine(line));
     const deduped = [];
     for (const line of content) {
-      if (deduped[deduped.length - 1] !== line) deduped.push(line);
+      if (line !== "" && deduped[deduped.length - 1] === line) continue;
+      deduped.push(line);
     }
-    return collapseRepeatedString(deduped.join("\n").trim());
+    return collapseRepeatedString(deduped.join("\n"));
   }
 
   function readTextWithoutMeta(textEl) {
     const tm = textEl.querySelector(":scope > .translatable-message, .translatable-message");
-    if (tm) {
-      return (tm.textContent || "").replace(/\u200b/g, "").trim();
-    }
-    const clone = textEl.cloneNode(true);
+    const base = tm ? tm.closest(".text-content") || tm : textEl;
+    const clone = base.cloneNode(true);
     clone.querySelectorAll(META_REMOVE_SELECTOR).forEach((el) => el.remove());
-    return (clone.textContent || "").replace(/\u200b/g, "").trim();
+    return readPlainTextFromElement(clone);
   }
 
   function extractTextFromRoot(root) {
@@ -1355,7 +1439,7 @@
         `${META_REMOVE_SELECTOR}, .message-subheader, .media-inner, .Album, .Photo, .Media, .Reactions, .${CHECK_CLASS}`
       )
       .forEach((el) => el.remove());
-    return sanitizeMessageText(clone.textContent || "");
+    return sanitizeMessageText(readPlainTextFromElement(clone));
   }
 
   function isUrlOrPhotoPlaceholder(text) {
@@ -1532,6 +1616,11 @@
   }
 
   function collectMessageImages(msg) {
+    const reactUrls = globalThis.TgReactBridge?.getImageUrls?.(msg) || [];
+    if (reactUrls.length) {
+      return reactUrls.slice(0, 5).map((url) => ({ url, img: null }));
+    }
+
     const items = [];
     const seen = new Set();
     const scopes = getAlbumScopeMessages(msg);
@@ -1670,39 +1759,16 @@
       [...new Set(imageItems.map((i) => i.url).filter(Boolean))],
       albumSlots
     );
-    const imageDataUrls = [];
-
-    if (imageItems.length) {
-      const imgCount = Math.min(albumSlots, imageItems.length);
-      const perImgMs = manual ? 2800 : 5000;
-      const fetched = await Promise.all(
-        imageItems.slice(0, imgCount).map((item) =>
-          Promise.race([
-            fetchImageAsDataUrl(item.url, item.img).catch(() => null),
-            new Promise((r) => setTimeout(() => r(null), perImgMs)),
-          ])
-        )
-      );
-      for (const data of fetched) {
-        if (data) imageDataUrls.push(data);
-      }
-    }
-
-    const dedupedData =
-      albumSlots > 1
-        ? TgFbImageDedupe.dedupeImageRefs(imageDataUrls, albumSlots)
-        : TgFbImageDedupe.pickSingleBestDataUrl(imageDataUrls);
-    const imageStashKey = dedupedData.length ? await stashImageData(messageId, dedupedData) : null;
 
     return {
       messageId,
       sender,
       text,
       links,
-      imageUrls: imageStashKey ? [] : rawUrls,
-      imageDataUrls: imageStashKey ? [] : dedupedData,
-      imageStashKey,
-      hasImages: dedupedData.length > 0 || rawUrls.length > 0,
+      imageUrls: rawUrls,
+      imageDataUrls: [],
+      imageStashKey: null,
+      hasImages: rawUrls.length > 0 || hasMediaShell,
       mediaShell: hasMediaShell,
       albumSlots,
       isSticker: stickerOnly,
@@ -1728,7 +1794,7 @@
           border: 1px solid #2481cc;
           border-radius: 10px;
           pointer-events: auto;
-          max-height: min(42vh, 320px);
+          max-height: min(28vh, 220px);
           overflow-y: auto;
         }
         #${BAR_ID}.tgfb-mini {
@@ -1855,7 +1921,7 @@
       <div id="tgfb-forward-status" class="status tgfb-expand-only">转发状态：等待操作</div>
       <div class="row tgfb-expand-only" id="tgfb-bar-body">
         <textarea id="tgfb-fb-urls" placeholder="每行一个，必须用此格式：&#10;https://www.facebook.com/messages/t/1234567890"></textarea>
-        <p class="tgfb-hint tgfb-expand-only">每行一个群链接（最多 10 个），须含 <code>/messages/t/</code>；转发前请自行打开全部群聊页并保持登录</p>
+        <p class="tgfb-hint tgfb-expand-only">每行一个群链接（最多 10 个），须含 <code>/messages/t/</code>；只要 Chrome 已登录 Facebook 即可，无需打开群聊页，后台静默群发</p>
       </div>
       <div class="row tgfb-expand-only" id="tgfb-sender-row">
         <div id="${SENDER_LIST_ID}"></div>
@@ -1864,7 +1930,7 @@
         <summary>废话过滤（可选）</summary>
         <textarea id="tgfb-filter" placeholder="每行一条，包含即不转发"></textarea>
       </details>
-      <div class="status tgfb-expand-only" id="tgfb-bar-status">请先手动打开 FB 群聊页；消息下方可点「转发」或勾选「自动」持续转发</div>
+      <div class="status tgfb-expand-only" id="tgfb-bar-status">配置 FB 群链接并勾选「启用转发」；须 Chrome 已登录 Facebook，后台静默发送，不影响您操作</div>
       <div class="status tgfb-expand-only" id="tgfb-chat-id"></div>
     `;
 

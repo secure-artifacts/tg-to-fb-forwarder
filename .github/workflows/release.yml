@@ -23,7 +23,7 @@ jobs:
           set -euo pipefail
 
           mkdir -p dist/icons
-          cp manifest.json background.js telegram-content.js facebook-content.js \
+          cp manifest.json background.js config.js telegram-content.js telegram-react-bridge.js \
             fb-api-send.js filter.js image-dedupe.js popup.html popup.js popup.css dist/
           cp icons/icon16.png icons/icon48.png icons/icon128.png dist/icons/
 

@@ -1,4 +1,5 @@
 const statusEl = document.getElementById("status");
+const forwardLogEl = document.getElementById("forwardLog");
 
 if (!chrome?.runtime?.id) {
   document.addEventListener("DOMContentLoaded", () => {
@@ -10,6 +11,55 @@ function setStatus(text, type) {
   statusEl.hidden = false;
   statusEl.textContent = text;
   statusEl.className = `status ${type || "ok"}`;
+}
+
+function formatLogTime(ts) {
+  if (!ts) return "";
+  try {
+    return new Date(ts).toLocaleString("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+}
+
+function renderForwardLog(log) {
+  if (!forwardLogEl) return;
+  forwardLogEl.innerHTML = "";
+  if (!log?.length) {
+    const li = document.createElement("li");
+    li.textContent = "暂无转发记录";
+    forwardLogEl.appendChild(li);
+    return;
+  }
+  for (const item of log) {
+    const li = document.createElement("li");
+    const head = document.createElement("div");
+    head.className = item.ok ? "ok" : "err";
+    head.textContent = item.ok
+      ? `成功 → 群 ${item.threadId || "?"}${item.mode ? ` (${item.mode})` : ""}`
+      : `失败 → 群 ${item.threadId || "?"}：${item.error || "未知错误"}`;
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = `${formatLogTime(item.time)} · ${item.text || "(无文本)"}${item.manual ? " · 手动" : ""}`;
+    li.appendChild(head);
+    li.appendChild(meta);
+    forwardLogEl.appendChild(li);
+  }
+}
+
+async function loadForwardLog() {
+  try {
+    const res = await send("GET_FORWARD_LOG");
+    renderForwardLog(res.log || []);
+  } catch {
+    renderForwardLog([]);
+  }
 }
 
 function send(type, payload) {
@@ -52,3 +102,5 @@ send("GET_CONFIG")
     if (input && u) input.value = u;
   })
   .catch((e) => setStatus(e.message || "无法连接扩展后台", "err"));
+
+loadForwardLog();

@@ -11,7 +11,7 @@
       <img class="brand-icon" src="icons/icon48.png" width="44" height="44" alt="" />
       <div class="brand-text">
         <h1>TG → FB 转发</h1>
-        <p>在 Telegram 页面里配置 FB 群，并在发言者下方勾选转发</p>
+        <p>在 Telegram 页面配置 FB 群；Chrome 登录 Facebook 后即可后台静默群发</p>
       </div>
     </header>
 
@@ -23,13 +23,19 @@
         placeholder="https://web.telegram.org/a/#-1001234567890"
       />
       <button id="openTgTabBtn" type="button" class="primary-large">打开 Telegram 监听标签页</button>
-      <p class="hint">须为 <code>web.telegram.org/a/#-100…</code>（从浏览器地址栏复制，勿用全 0 的假 ID）。若页面一直转圈：先登录 TG，或留空链接打开首页再从左侧进群。加载出聊天列表后，在<strong>顶部蓝条</strong>配置 FB 并勾选发言者。</p>
+      <p class="hint">须为 <code>web.telegram.org/a/#-100…</code>（从浏览器地址栏复制）。加载出聊天列表后，在<strong>顶部蓝条</strong>填写 FB 群链接并勾选发言者。转发走后台 API，<strong>无需打开 FB 群聊页</strong>，不会抢占鼠标或刷新页面。</p>
     </section>
 
     <p id="status" class="status" hidden></p>
 
+    <section class="card">
+      <h2>最近转发日志</h2>
+      <ul id="forwardLog" class="forward-log"></ul>
+      <p class="hint">显示最近 50 条成功/失败记录及原因。</p>
+    </section>
+
     <footer>
-      <p>请保持该 TG 标签页不要关闭，并登录 Telegram / Facebook。</p>
+      <p>请保持 Telegram 监听标签页打开；Facebook 只需在 Chrome 中登录过即可（任意标签页，无需保持打开）。</p>
     </footer>
 
     <script src="popup.js"></script>

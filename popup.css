@@ -228,3 +228,34 @@ code {
   background: #e8f0fe;
   color: #1967d2;
 }
+
+.forward-log {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 180px;
+  overflow-y: auto;
+  font-size: 11px;
+}
+
+.forward-log li {
+  padding: 6px 0;
+  border-bottom: 1px solid #e2e6ea;
+}
+
+.forward-log li:last-child {
+  border-bottom: none;
+}
+
+.forward-log .ok {
+  color: #137333;
+}
+
+.forward-log .err {
+  color: #c5221f;
+}
+
+.forward-log .meta {
+  color: #666;
+  font-size: 10px;
+}
