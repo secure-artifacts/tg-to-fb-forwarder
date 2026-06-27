@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Telegram → Facebook 群消息转发",
-  "version": "2.0.2",
+  "version": "2.1.1",
   "description": "Telegram 群消息静默转发到 Facebook Messenger；纯后台 API，无需打开群聊页",
   "permissions": ["storage", "tabs", "alarms", "notifications", "scripting", "cookies"],
   "host_permissions": [

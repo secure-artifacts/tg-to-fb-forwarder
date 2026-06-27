@@ -228,17 +228,52 @@ const MERCURY_SEND_ATTEMPTS = [
   },
 ];
 
+function mercuryHasSuccessPayload(json, body) {
+  const payload = json?.payload;
+  if (!payload || typeof payload !== "object") return false;
+
+  const actions = payload.actions;
+  if (Array.isArray(actions) && actions.length) {
+    return actions.some((a) => a?.message_id || a?.msgid || a?.offline_threading_id);
+  }
+  if (payload.message_id || payload.msgid || payload.offline_threading_id) return true;
+  const msg = payload.message;
+  if (msg && (msg.message_id || msg.id || msg.msgid)) return true;
+
+  const text = String(body || "");
+  return (
+    /"message_id"\s*:\s*"(m_[^"]+|mid\.[^"]+)"/i.test(text) &&
+    /"payload"\s*:\s*\{/.test(text)
+  );
+}
+
 function parseMercurySendResponse(res, body) {
   if (res.status === 404) return { ok: false, error: "HTTP 404", retry: true };
   if (!res.ok) return { ok: false, error: `HTTP ${res.status}`, retry: res.status >= 500 };
+
+  const raw = String(body || "").trim();
+  if (!raw) return { ok: false, error: "Facebook 返回空响应", retry: true };
+
   const json = parseFbJsonResponse(body);
-  if (json?.error || json?.errorSummary) {
-    return { ok: false, error: json.errorSummary || json.error, retry: false };
+  if (json?.errorSummary) {
+    return { ok: false, error: json.errorSummary, retry: false };
   }
-  if (/login|checkpoint/i.test(body) && !/payload|success/i.test(body)) {
+  if (json?.error != null && json.error !== 0 && json.error !== false) {
+    const desc = json.errorDescription || json.errorMessage;
+    return { ok: false, error: desc || `Facebook 错误码 ${json.error}`, retry: false };
+  }
+
+  if (/login|checkpoint/i.test(raw) && !mercuryHasSuccessPayload(json, raw)) {
     return { ok: false, error: "Facebook 要求重新登录或安全验证", retry: false };
   }
-  return { ok: true };
+
+  if (mercuryHasSuccessPayload(json, raw)) return { ok: true };
+
+  if (!json && /<html[\s>]/i.test(raw)) {
+    return { ok: false, error: "Facebook 返回网页而非发送结果，请确认已登录", retry: true };
+  }
+
+  return { ok: false, error: "Facebook 未确认消息已发送", retry: true };
 }
 
 async function tryMercurySendEndpoints(threadId, session, payload, fetchImpl = fetchFbWithTimeout) {
@@ -270,14 +305,24 @@ function parseGraphqlJson(body) {
 }
 
 function graphqlSendSucceeded(json) {
-  if (!json) return false;
-  if (json.errors?.length) return false;
+  if (!json || json.errors?.length) return false;
   const data = json.data;
-  if (!data) return true;
-  const node = data.send_chat_message || data.xma_send_message || Object.values(data)[0];
-  if (!node) return true;
-  if (node.errors?.length) return false;
-  return true;
+  if (!data || typeof data !== "object") return false;
+
+  const candidates = [
+    data.send_chat_message,
+    data.xma_send_message,
+    data.lightspeed_send_message,
+    ...Object.values(data),
+  ].filter((v) => v && typeof v === "object");
+
+  for (const node of candidates) {
+    if (node.errors?.length) continue;
+    const msg = node.message || node.sent_message;
+    if (msg && (msg.message_id || msg.id || msg.msgid)) return true;
+    if (node.message_id || node.msgid) return true;
+  }
+  return false;
 }
 
 async function sendViaGraphQL(threadId, session, { text, imageIds }) {
@@ -329,7 +374,7 @@ async function sendViaGraphQL(threadId, session, { text, imageIds }) {
       continue;
     }
     if (graphqlSendSucceeded(json)) return { ok: true, mode: "graphql" };
-    lastErr = "GraphQL 未返回成功结果";
+    lastErr = json ? "GraphQL 未返回 message_id" : "GraphQL 响应无法解析";
   }
 
   throw new Error(lastErr);
@@ -339,7 +384,11 @@ async function sendPayloadWithSession(threadId, session, payload) {
   const mercury = await tryMercurySendEndpoints(threadId, session, payload);
   if (mercury.ok) return { ok: true, mode: mercury.mode, url: mercury.url };
 
-  return sendViaGraphQL(threadId, session, payload);
+  try {
+    return await sendViaGraphQL(threadId, session, payload);
+  } catch (err) {
+    throw new Error(mercury.error ? `${mercury.error}；${err.message}` : err.message);
+  }
 }
 
 async function sendMessengerJob(threadId, job) {
@@ -358,7 +407,9 @@ async function sendMessengerJob(threadId, job) {
     }
   }
 
-  return sendPayloadWithSession(threadId, session, { text, imageIds });
+  const result = await sendPayloadWithSession(threadId, session, { text, imageIds });
+  if (!result?.ok) throw new Error(result?.error || "Facebook 发送失败");
+  return result;
 }
 
 if (typeof globalThis !== "undefined") {

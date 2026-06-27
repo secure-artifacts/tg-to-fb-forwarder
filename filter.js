@@ -9,8 +9,10 @@ function shouldFilterMessage(text, rules, options = {}) {
   const normalized = (text || "").trim();
   if (!normalized) return false;
 
+  const maxRuleLen =
+    (typeof TgFbConfig !== "undefined" && TgFbConfig.MAX_FILTER_RULE_LENGTH) || 200;
   const activeRules = (rules || [])
-    .map((r) => String(r || "").trim())
+    .map((r) => String(r || "").trim().slice(0, maxRuleLen))
     .filter(Boolean);
   if (!activeRules.length) return false;
 
@@ -20,8 +22,17 @@ function shouldFilterMessage(text, rules, options = {}) {
       continue;
     }
     if (mode === "regex") {
+      const maxPat =
+        (typeof TgFbConfig !== "undefined" && TgFbConfig.MAX_REGEX_PATTERN_LENGTH) || 120;
+      const maxText =
+        (typeof TgFbConfig !== "undefined" && TgFbConfig.MAX_FORWARD_TEXT_LENGTH) || 12000;
+      if (rule.length > maxPat) {
+        if (normalized.toLowerCase().includes(rule.toLowerCase().slice(0, maxPat))) return true;
+        continue;
+      }
+      const sample = normalized.length > maxText ? normalized.slice(0, maxText) : normalized;
       try {
-        if (new RegExp(rule, "i").test(normalized)) return true;
+        if (new RegExp(rule, "i").test(sample)) return true;
       } catch {
         if (normalized.toLowerCase().includes(rule.toLowerCase())) return true;
       }

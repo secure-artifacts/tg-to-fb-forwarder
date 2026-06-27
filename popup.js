@@ -28,6 +28,15 @@ function formatLogTime(ts) {
   }
 }
 
+const ERROR_CATEGORY_LABELS = {
+  login: "登录/会话",
+  network: "网络",
+  rate_limit: "限流",
+  checkpoint: "安全验证",
+  api: "API",
+  unknown: "其他",
+};
+
 function renderForwardLog(log) {
   if (!forwardLogEl) return;
   forwardLogEl.innerHTML = "";
@@ -43,7 +52,7 @@ function renderForwardLog(log) {
     head.className = item.ok ? "ok" : "err";
     head.textContent = item.ok
       ? `成功 → 群 ${item.threadId || "?"}${item.mode ? ` (${item.mode})` : ""}`
-      : `失败 → 群 ${item.threadId || "?"}：${item.error || "未知错误"}`;
+      : `失败 → 群 ${item.threadId || "?"} [${ERROR_CATEGORY_LABELS[item.errorCategory] || ERROR_CATEGORY_LABELS.unknown}]：${item.error || "未知错误"}`;
     const meta = document.createElement("div");
     meta.className = "meta";
     meta.textContent = `${formatLogTime(item.time)} · ${item.text || "(无文本)"}${item.manual ? " · 手动" : ""}`;

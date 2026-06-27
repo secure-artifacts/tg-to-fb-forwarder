@@ -2,7 +2,6 @@
   const BAR_ID = "tgfb-settings-bar";
   const BAR_COLLAPSED_KEY = "tgfbBarCollapsed";
   const BAR_POSITION_KEY = "tgfbBarPosition";
-  const IMAGE_STASH_PREFIX = "tgfb_img_";
   const CHECK_CLASS = "tgfb-msg-check";
   const SENDER_LIST_ID = "tgfb-sender-list";
   let barResizeObserver = null;
@@ -10,15 +9,22 @@
   const forwardingIds = new Set();
   const mediaRetryScheduled = new Set();
   let config = null;
+  let pollTimer = null;
   let observer = null;
-  let observedRoot = null;
-  let scanTimer = null;
   let currentChatKey = "";
   let lastSummaryText = "";
   let lastForwardUiText = "";
   let chatReadyForForward = false;
   let senderSyncPausedUntil = 0;
   let checkboxDelegationBound = false;
+  let chatChangeGen = 0;
+  let chatUrlSaveTimer = null;
+  let lastScanAt = 0;
+  let lastStatusAt = 0;
+  let injectInProgress = false;
+  const POLL_INTERVAL_MS = 8000;
+  const SCAN_MIN_INTERVAL_MS = 4000;
+  const INJECT_BUDGET_PER_PASS = 25;
 
   scheduleBarInjection();
 
@@ -35,17 +41,17 @@
     await loadConfig();
     bindCheckboxDelegation();
     bindChatNavigation();
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) stopPollLoop();
+      else {
+        startPollLoop();
+        if (chatReadyForForward) scanNewMessagesThrottled();
+      }
+    });
     await waitForTelegramShell(20000);
     scheduleBarInjection();
     onChatChanged(true).catch((err) => console.error("[tg-to-fb] onChatChanged", err));
-    let statusTick = 0;
-    setInterval(() => {
-      if (!isTelegramStuckLoading()) {
-        ensureObserver();
-        runInjectPass();
-      }
-      if (++statusTick % 5 === 0) updateBarStatus();
-    }, 2000);
+    startPollLoop();
 
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area === "local" && changes.config) {
@@ -73,8 +79,6 @@
       if (msg?.type === "TG_RELOAD_CONFIG") {
         loadConfig().then(() => {
           syncSettingsBar();
-          syncAllCheckboxes();
-          renderSenderPicker();
           updateBarStatus();
           sendResponse({ ok: true });
         });
@@ -82,9 +86,7 @@
       }
       if (msg?.type === "TG_WAKE_SCAN") {
         try {
-          ensureObserver();
-          runInjectPass();
-          scanNewMessages();
+          scanNewMessagesThrottled();
           sendResponse({ ok: true });
         } catch (err) {
           sendResponse({ ok: false, error: err?.message });
@@ -92,12 +94,6 @@
         return true;
       }
       return false;
-    });
-
-    window.addEventListener("tgfb-wake-scan", () => {
-      ensureObserver();
-      runInjectPass();
-      scanNewMessages();
     });
 
     if (chrome?.runtime?.id) {
@@ -227,7 +223,6 @@
         if (!(cb instanceof HTMLInputElement)) return;
         if (!cb.matches(".tgfb-cb, .tgfb-picker-cb")) return;
         e.stopPropagation();
-        e.stopImmediatePropagation();
         const sender = getSenderFromControl(cb);
         if (!sender || sender === "未知") {
           cb.checked = false;
@@ -235,7 +230,7 @@
         }
         void toggleSender(sender, cb.checked);
       },
-      true
+      false
     );
   }
 
@@ -333,10 +328,6 @@
   }
 
   function extractStablePeerKey(listItem) {
-    const msg = normalizeMessageEl(listItem);
-    const reactPeer = globalThis.TgReactBridge?.getMessageMeta?.(msg)?.peerId;
-    if (reactPeer) return `peer:${reactPeer}`;
-
     const av = findAvatarInListItem(listItem);
     if (!av) return "";
     const peer =
@@ -543,48 +534,88 @@
     window.addEventListener("popstate", () => onChatChanged(false));
   }
 
+  function scheduleChatUrlSave() {
+    clearTimeout(chatUrlSaveTimer);
+    chatUrlSaveTimer = setTimeout(() => {
+      if (isInGroupChat()) saveConfig({ telegramChatUrl: location.href });
+    }, 2500);
+  }
+
   async function onChatChanged(isInit) {
     const key = getChatKey();
     if (!isInit && key === currentChatKey) return;
     currentChatKey = key;
+    const gen = ++chatChangeGen;
     chatReadyForForward = false;
     seenIds.clear();
 
-    if (isInGroupChat()) {
-      saveConfig({ telegramChatUrl: location.href });
-    }
+    if (isInGroupChat()) scheduleChatUrlSave();
 
-    ensureObserver();
-    await waitForChatReady(20000);
+    await waitForChatReady(12000, gen);
+    if (gen !== chatChangeGen) return;
     await markAllVisibleMessagesSeen();
+    if (gen !== chatChangeGen) return;
     chatReadyForForward = true;
-    runInjectPass();
-    setTimeout(runInjectPass, 1500);
-    setTimeout(runInjectPass, 4000);
   }
 
-  async function waitForChatReady(maxMs) {
+  function startPollLoop() {
+    // 轮询作为保底，用于状态更新
+    if (!pollTimer) {
+      pollTimer = setInterval(() => {
+        const now = Date.now();
+        if (now - lastStatusAt > 30000) {
+          lastStatusAt = now;
+          updateBarStatus();
+        }
+        // 如果 observer 没在跑，轮询作为备选扫描
+        if (!observer && chatReadyForForward && config?.enabled) {
+          scanNewMessagesThrottled();
+        }
+      }, POLL_INTERVAL_MS);
+    }
+
+    // 使用 MutationObserver 实现零延迟检测
+    if (!observer) {
+      const target = document.querySelector(".MessageList, .messages-container, #MiddleColumn") || document.body;
+      observer = new MutationObserver((mutations) => {
+        if (!chatReadyForForward || !config?.enabled) return;
+        let shouldScan = false;
+        for (const m of mutations) {
+          if (m.addedNodes.length > 0) {
+            shouldScan = true;
+            break;
+          }
+        }
+        if (shouldScan) {
+          // 这里的节流可以设得更短，或者直接调用 scanNewMessages
+          scanNewMessages();
+        }
+      });
+      observer.observe(target, { childList: true, subtree: true });
+      console.log("[tg-to-fb] MutationObserver started for zero-delay forwarding");
+    }
+  }
+
+  function stopPollLoop() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+  }
+
+  async function waitForChatReady(maxMs, gen) {
     const start = Date.now();
     while (Date.now() - start < maxMs) {
+      if (gen != null && gen !== chatChangeGen) return false;
       if (findMessageNodes().length > 0) return true;
       if (!isInGroupChat()) return false;
-      ensureObserver();
-      await new Promise((r) => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, 600));
     }
     return false;
-  }
-
-  function ensureObserver() {
-    const root =
-      document.querySelector(".MessageList") ||
-      document.querySelector(".messages-container") ||
-      document.querySelector("#MiddleColumn");
-    if (!root) return;
-    if (root === observedRoot && observer) return;
-    if (observer) observer.disconnect();
-    observedRoot = root;
-    observer = new MutationObserver(() => scheduleWork());
-    observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "srcset"] });
   }
 
   function waitForTelegramShell(maxMs) {
@@ -601,24 +632,11 @@
     });
   }
 
-  function scheduleWork() {
-    if (scanTimer) return;
-    scanTimer = setTimeout(() => {
-      scanTimer = null;
-      runInjectPass();
-      if (chatReadyForForward) scanNewMessages();
-    }, 50);
-  }
-
-  function runInjectPass() {
-    try {
-      injectMessageCheckboxes();
-      renderSenderPicker();
-      updateBarStatus();
-    } catch (err) {
-      console.error("[tg-to-fb] runInjectPass failed", err);
-      scheduleBarInjection();
-    }
+  function scanNewMessagesThrottled() {
+    const now = Date.now();
+    if (now - lastScanAt < SCAN_MIN_INTERVAL_MS) return;
+    lastScanAt = now;
+    scanNewMessages();
   }
 
   function scanExistingMessages() {
@@ -629,10 +647,9 @@
   }
 
   async function markAllVisibleMessagesSeen() {
-    for (const ms of [0, 300, 800, 2000, 4500]) {
-      if (ms) await new Promise((r) => setTimeout(r, ms));
-      scanExistingMessages();
-    }
+    scanExistingMessages();
+    await new Promise((r) => setTimeout(r, 800));
+    scanExistingMessages();
   }
 
   function markSenderMessagesSeen(senderName) {
@@ -643,21 +660,65 @@
     }
   }
 
-  function getMessageId(el) {
+  /** 仅扫描 DOM 更新顶部发言者列表，不修改消息区域 */
+  function runManualInject() {
+    if (injectInProgress) return;
+    injectInProgress = true;
+    updateBarStatus("正在刷新发言者…");
+
+    const finish = () => {
+      renderSenderPicker();
+      injectInProgress = false;
+      updateBarStatus(`已刷新，识别到 ${collectSenders().length} 位发言者`);
+    };
+
+    const idle = window.requestIdleCallback || ((cb) => setTimeout(cb, 80));
+    idle(finish);
+  }
+
+  /** 可选：在可见消息下加载「转发」按钮，分批注入 */
+  function runMessageButtonInject() {
+    if (injectInProgress) return;
+    injectInProgress = true;
+    updateBarStatus("正在加载消息按钮（分批）…");
+
+    const runBatch = () => {
+      const remaining = injectMessageCheckboxes({ budget: INJECT_BUDGET_PER_PASS });
+      if (remaining > 0) {
+        const idle = window.requestIdleCallback || ((cb) => setTimeout(cb, 150));
+        idle(() => runBatch());
+        return;
+      }
+      syncAllCheckboxes(true);
+      injectInProgress = false;
+      updateBarStatus("消息按钮已加载");
+    };
+
+    try {
+      runBatch();
+    } catch (err) {
+      injectInProgress = false;
+      console.error("[tg-to-fb] runMessageButtonInject failed", err);
+      updateBarStatus("加载失败，请重试", "err");
+    }
+  }
+
+  function getMessageId(el, opts = {}) {
     const msg = normalizeMessageEl(el);
     const domId =
       msg.getAttribute("data-message-id") ||
       msg.querySelector("[data-message-id]")?.getAttribute("data-message-id") ||
       "";
-    if (domId) return domId;
-    const reactId = globalThis.TgReactBridge?.getMessageMeta?.(msg)?.messageId;
-    return reactId ? String(reactId) : "";
+    if (domId && domId !== "0") return domId;
+    if (opts.allowReact) {
+      const reactId = globalThis.TgReactBridge?.getMessageMeta?.(msg)?.messageId;
+      return reactId ? String(reactId) : "";
+    }
+    return "";
   }
 
   function isOwnMessage(el) {
     const msg = normalizeMessageEl(el);
-    const reactMeta = globalThis.TgReactBridge?.getMessageMeta?.(msg);
-    if (reactMeta?.isOutgoing === true) return true;
     if (msg.classList.contains("own")) return true;
     if (msg.classList.contains("message-out") || msg.classList.contains("is-out")) return true;
     if (msg.getAttribute("data-is-out") === "true") return true;
@@ -696,12 +757,14 @@
     return true;
   }
 
-  function extractSender(el, listItem) {
+  function extractSender(el, listItem, opts = {}) {
     const msg = normalizeMessageEl(el);
     const scope = listItem || getMessageListItem(msg);
 
-    const reactSender = normalizeSenderName(globalThis.TgReactBridge?.getSenderName?.(msg) || "");
-    if (reactSender && isLikelySenderName(reactSender)) return reactSender;
+    if (opts.useReact) {
+      const reactSender = normalizeSenderName(globalThis.TgReactBridge?.getSenderName?.(msg) || "");
+      if (reactSender && isLikelySenderName(reactSender)) return reactSender;
+    }
 
     const fromTitle = extractSenderFromVisibleTitle(msg);
     if (fromTitle) return fromTitle;
@@ -845,9 +908,7 @@
   }
 
   function scheduleInjectRetries() {
-    for (const ms of [200, 600, 1200, 2500, 4000]) {
-      setTimeout(injectMessageCheckboxes, ms);
-    }
+    /* 已改为手动刷新，不再自动重试注入 */
   }
 
   function countMessagesMissingCheckbox() {
@@ -874,7 +935,7 @@
   }
 
   function forwardMessageNow(msg, sender, btn) {
-    const messageId = getMessageId(msg);
+    const messageId = getMessageId(msg, { allowReact: true });
     if (!messageId) {
       updateBarStatus("无法识别消息，请刷新页面", "err");
       return;
@@ -890,9 +951,11 @@
     processMessageForward(msg, sender, messageId, { manual: true, btn });
   }
 
-  /** 自动勾选 + 立即转发按钮，放在头像下方 */
+  /** 消息下方「自动/转发」按钮；仅手动刷新时分批注入，返回仍未注入条数 */
   function injectMessageCheckboxes(opts = {}) {
     let injected = 0;
+    let budget = opts.budget ?? Infinity;
+    let remaining = 0;
     const nodes = findMessageNodes();
     const ctx = { lastSender: "", lastStablePeer: "", peerNames: new Map() };
 
@@ -913,6 +976,11 @@
       }
       if (!messageNeedsCheckbox(msg)) continue;
 
+      if (budget <= 0) {
+        remaining++;
+        continue;
+      }
+
       const wrap = buildMessageActionsWrap(sender || "未知");
       const btn = wrap.querySelector(".tgfb-forward-now");
       btn.addEventListener("click", (e) => {
@@ -921,19 +989,14 @@
         const liveSender = wrap.dataset.sender || normalizeSenderName(sender) || "未知";
         forwardMessageNow(msg, liveSender, btn);
       });
-      if (placeCheckboxOnMessage(msg, wrap)) injected++;
+      if (placeCheckboxOnMessage(msg, wrap)) {
+        injected++;
+        budget--;
+      }
     }
+
     if (!opts.skipSync) syncAllCheckboxes();
-
-    if (countMessagesMissingCheckbox() > 0) scheduleInjectRetries();
-
-    const status = document.getElementById("tgfb-bar-status");
-    const total = findMessageNodes().length;
-    if (status && injected === 0 && total === 0) {
-      status.textContent = "未检测到消息：请确认在 web.telegram.org/a 群聊内";
-    } else if (status && injected === 0 && total > 0) {
-      status.textContent = `已识别 ${total} 条消息，${collectSenders().length} 人 · 请在顶部列表勾选`;
-    }
+    return remaining;
   }
 
   function renderSenderPicker() {
@@ -952,7 +1015,7 @@
     host.innerHTML = "";
     const hint = document.createElement("p");
     hint.className = "tgfb-hint";
-    hint.textContent = "消息下方有「转发」可立即发送；「自动」勾选后可持续转发该人：";
+    hint.textContent = "勾选要自动转发的人；如需单条「转发」按钮，可展开后点「加载消息按钮」：";
     host.appendChild(hint);
 
     for (const name of senders) {
@@ -994,7 +1057,6 @@
     const watchUserNames = [...list];
     const watchSenderPeerKeys = rebuildWatchPeerKeysForList(watchUserNames);
     config = { ...config, watchUserNames, watchSenderPeerKeys };
-    injectMessageCheckboxes({ skipSync: true });
     syncAllCheckboxes(true);
     if (enabled) markSenderMessagesSeen(name);
     updateBarStatus(enabled ? `已监听：${name}` : `已取消：${name}`);
@@ -1174,7 +1236,8 @@
           payload.text?.trim() ||
           payload.imageDataUrls?.length ||
           payload.imageUrls?.length ||
-          payload.imageStashKey
+          payload.hasImages ||
+          payload.mediaShell
         );
         if (!hasContent) {
           forwardingIds.delete(messageId);
@@ -1715,13 +1778,6 @@
     }
   }
 
-  async function stashImageData(messageId, imageDataUrls) {
-    if (!imageDataUrls.length) return null;
-    const key = IMAGE_STASH_PREFIX + messageId;
-    await chrome.storage.local.set({ [key]: imageDataUrls });
-    return key;
-  }
-
   function blobToDataUrl(blob) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -1748,7 +1804,6 @@
         links,
         imageUrls: [],
         imageDataUrls: [],
-        imageStashKey: null,
         hasImages: false,
         mediaShell: false,
         albumSlots,
@@ -1767,7 +1822,6 @@
       links,
       imageUrls: rawUrls,
       imageDataUrls: [],
-      imageStashKey: null,
       hasImages: rawUrls.length > 0 || hasMediaShell,
       mediaShell: hasMediaShell,
       albumSlots,
@@ -1823,10 +1877,7 @@
           white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
         /* 只给消息列表留白，不移动整列（避免底部输入框被挤出屏幕） */
-        body.tgfb-bar-active:not(.tgfb-bar-mini-layout) #MiddleColumn .MessageList,
-        body.tgfb-bar-active:not(.tgfb-bar-mini-layout) #MiddleColumn .messages-container {
-          padding-top: var(--tgfb-bar-height, 0px) !important;
-        }
+        /* 已禁用：修改 MessageList padding 会触发 TG 频繁重排导致卡顿 */
         #${BAR_ID} .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 6px; }
         #${BAR_ID} label { display: flex; align-items: center; gap: 6px; font-weight: 600; cursor: pointer; }
         #${BAR_ID} textarea {
@@ -1914,6 +1965,7 @@
         <label><input type="checkbox" id="tgfb-enabled" /> 启用转发</label>
         <button type="button" id="tgfb-save">保存</button>
         <button type="button" class="secondary" id="tgfb-refresh-senders">刷新发言者</button>
+        <button type="button" class="secondary tgfb-expand-only" id="tgfb-inject-buttons">加载消息按钮</button>
         <button type="button" class="secondary tgfb-expand-only" id="tgfb-open-home">TG 卡住</button>
         <span id="tgfb-mini-status" class="tgfb-mini-status"></span>
         <button type="button" class="secondary" id="tgfb-bar-toggle">展开</button>
@@ -1947,8 +1999,10 @@
         location.href = "https://web.telegram.org/a/";
       });
       bar.querySelector("#tgfb-refresh-senders").addEventListener("click", () => {
-        runInjectPass();
-        updateBarStatus(`已刷新，识别到 ${collectSenders().length} 位发言者`);
+        runManualInject();
+      });
+      bar.querySelector("#tgfb-inject-buttons")?.addEventListener("click", () => {
+        runMessageButtonInject();
       });
       bar.querySelector("#tgfb-enabled").addEventListener("change", async (e) => {
         config.enabled = e.target.checked;
@@ -1971,7 +2025,6 @@
       initBarCollapseState(bar);
       loadBarPosition(bar);
       syncSettingsBar();
-      renderSenderPicker();
       updateBarStatus();
     } catch (err) {
       console.error("[tg-to-fb] bar setup failed", err);
@@ -1997,19 +2050,14 @@
 
   function initBarCollapseState(bar) {
     chrome.storage.local.get([BAR_COLLAPSED_KEY], (data) => {
-      const collapsed = data[BAR_COLLAPSED_KEY] === true;
+      const collapsed = data[BAR_COLLAPSED_KEY] !== false;
       setBarExpanded(!collapsed);
     });
   }
 
-  function bindBarResizeObserver(bar) {
+  function bindBarResizeObserver(_bar) {
     if (barResizeObserver) barResizeObserver.disconnect();
-    if (typeof ResizeObserver === "undefined") {
-      setInterval(applyBarOffset, 1500);
-      return;
-    }
-    barResizeObserver = new ResizeObserver(() => applyBarOffset());
-    barResizeObserver.observe(bar);
+    barResizeObserver = null;
   }
 
   function clampBarToViewport(bar) {
@@ -2082,7 +2130,8 @@
 
     function onPointerDown(e) {
       if (e.button !== 0 && e.pointerType === "mouse") return;
-      if (isDragInteractiveTarget(e.target)) return;
+      if (e.target !== handle && isDragInteractiveTarget(e.target)) return;
+      if (e.target !== handle) return;
       dragging = true;
       pointerId = e.pointerId;
       bar.setPointerCapture?.(pointerId);
@@ -2122,7 +2171,7 @@
       applyBarOffset();
     }
 
-    bar.addEventListener("pointerdown", onPointerDown);
+    handle.addEventListener("pointerdown", onPointerDown);
     bar.addEventListener("pointermove", onPointerMove);
     bar.addEventListener("pointerup", onPointerUp);
     bar.addEventListener("pointercancel", onPointerUp);
@@ -2141,22 +2190,8 @@
   }
 
   function applyBarOffset() {
-    const bar = document.getElementById(BAR_ID);
-    if (!bar || isTelegramStuckLoading()) {
-      document.body.classList.remove("tgfb-bar-active", "tgfb-bar-mini-layout");
-      document.documentElement.style.setProperty("--tgfb-bar-height", "0px");
-      return;
-    }
-    if (bar.classList.contains("tgfb-user-positioned")) {
-      document.body.classList.remove("tgfb-bar-active", "tgfb-bar-mini-layout");
-      document.documentElement.style.setProperty("--tgfb-bar-height", "0px");
-      return;
-    }
-    const mini = bar.classList.contains("tgfb-mini");
-    document.body.classList.toggle("tgfb-bar-mini-layout", mini);
-    document.body.classList.add("tgfb-bar-active");
-    const h = mini ? 0 : Math.ceil(bar.getBoundingClientRect().height);
-    document.documentElement.style.setProperty("--tgfb-bar-height", `${h}px`);
+    document.body.classList.remove("tgfb-bar-active", "tgfb-bar-mini-layout");
+    document.documentElement.style.setProperty("--tgfb-bar-height", "0px");
   }
 
   function syncSettingsBar() {
@@ -2219,9 +2254,8 @@
       }
     };
     tryInject();
-    setTimeout(tryInject, 300);
-    setTimeout(tryInject, 1200);
-    setInterval(tryInject, 3000);
+    setTimeout(tryInject, 500);
+    setTimeout(tryInject, 2000);
   }
 
   function isTelegramStuckLoading() {
@@ -2271,11 +2305,9 @@
     }
     const n = getWatchList().length;
     const fb = (config?.fbThreadUrls || []).length;
-    const senders = collectSenders().length;
-    const msgs = findMessageNodes().length;
     const on = config?.enabled ? "已启用" : "未启用";
     const stuck = isTelegramStuckLoading() ? " · ⚠️ TG未加载完" : "";
-    const summary = `${on} · ${msgs} 条 · ${senders} 人 · 勾选 ${n} · ${fb} 个 FB${stuck}`;
+    const summary = `${on} · 监听 ${n} 人 · ${fb} 个 FB 群 · 点「刷新发言者」加载列表${stuck}`;
     if (summary !== lastSummaryText) {
       lastSummaryText = summary;
       el.textContent = summary;
